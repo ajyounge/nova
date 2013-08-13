@@ -18,14 +18,14 @@ import datetime
 import webob
 
 from nova.api.openstack.compute.contrib import flavormanage
-from nova.compute import instance_types
+from nova.compute import flavors
 from nova import exception
 from nova.openstack.common import jsonutils
 from nova import test
 from nova.tests.api.openstack import fakes
 
 
-def fake_get_instance_type_by_flavor_id(flavorid, read_deleted='yes'):
+def fake_get_flavor_by_flavor_id(flavorid, read_deleted='yes'):
     if flavorid == 'failtest':
         raise exception.NotFound("Not found sucka!")
     elif not str(flavorid) == '1234':
@@ -62,7 +62,7 @@ def fake_create(name, memory_mb, vcpus, root_gb, ephemeral_gb,
                 flavorid, swap, rxtx_factor, is_public):
     if flavorid is None:
         flavorid = 1234
-    newflavor = fake_get_instance_type_by_flavor_id(flavorid,
+    newflavor = fake_get_flavor_by_flavor_id(flavorid,
                                                     read_deleted="no")
 
     newflavor["name"] = name
@@ -80,13 +80,19 @@ def fake_create(name, memory_mb, vcpus, root_gb, ephemeral_gb,
 class FlavorManageTest(test.TestCase):
     def setUp(self):
         super(FlavorManageTest, self).setUp()
-        self.stubs.Set(instance_types,
-                       "get_instance_type_by_flavor_id",
-                       fake_get_instance_type_by_flavor_id)
-        self.stubs.Set(instance_types, "destroy", fake_destroy)
-        self.stubs.Set(instance_types, "create", fake_create)
+        self.stubs.Set(flavors,
+                       "get_flavor_by_flavor_id",
+                       fake_get_flavor_by_flavor_id)
+        self.stubs.Set(flavors, "destroy", fake_destroy)
+        self.stubs.Set(flavors, "create", fake_create)
+        self.flags(
+            osapi_compute_extension=[
+                'nova.api.openstack.compute.contrib.select_extensions'],
+            osapi_compute_ext_list=['Flavormanage', 'Flavorextradata',
+                'Flavor_access', 'Flavor_rxtx', 'Flavor_swap'])
 
         self.controller = flavormanage.FlavorManageController()
+        self.app = fakes.wsgi_app(init_only=('flavors',))
 
     def test_delete(self):
         req = fakes.HTTPRequest.blank('/v2/123/flavors/1234')
@@ -117,7 +123,7 @@ class FlavorManageTest(test.TestCase):
         req.headers['Content-Type'] = 'application/json'
         req.method = 'POST'
         req.body = jsonutils.dumps(expected)
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(self.app)
         body = jsonutils.loads(res.body)
         for key in expected["flavor"]:
             self.assertEquals(body["flavor"][key], expected["flavor"][key])
@@ -150,13 +156,13 @@ class FlavorManageTest(test.TestCase):
             }
         }
 
-        self.stubs.Set(instance_types, "create", fake_create)
+        self.stubs.Set(flavors, "create", fake_create)
         url = '/v2/fake/flavors'
         req = webob.Request.blank(url)
         req.headers['Content-Type'] = 'application/json'
         req.method = 'POST'
         req.body = jsonutils.dumps(flavor)
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(self.app)
         body = jsonutils.loads(res.body)
         for key in expected["flavor"]:
             self.assertEquals(body["flavor"][key], expected["flavor"][key])
@@ -180,12 +186,12 @@ class FlavorManageTest(test.TestCase):
         req.headers['Content-Type'] = 'application/json'
         req.method = 'POST'
         req.body = jsonutils.dumps(expected)
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(self.app)
         body = jsonutils.loads(res.body)
         for key in expected["flavor"]:
             self.assertEquals(body["flavor"][key], expected["flavor"][key])
 
-    def test_instance_type_exists_exception_returns_409(self):
+    def test_flavor_exists_exception_returns_409(self):
         expected = {
             "flavor": {
                 "name": "test",
@@ -202,13 +208,28 @@ class FlavorManageTest(test.TestCase):
 
         def fake_create(name, memory_mb, vcpus, root_gb, ephemeral_gb,
                         flavorid, swap, rxtx_factor, is_public):
-            raise exception.InstanceTypeExists()
+            raise exception.InstanceTypeExists(name=name)
 
-        self.stubs.Set(instance_types, "create", fake_create)
+        self.stubs.Set(flavors, "create", fake_create)
         url = '/v2/fake/flavors'
         req = webob.Request.blank(url)
         req.headers['Content-Type'] = 'application/json'
         req.method = 'POST'
         req.body = jsonutils.dumps(expected)
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(self.app)
         self.assertEqual(res.status_int, 409)
+
+    def test_invalid_memory_mb(self):
+        """Check negative and decimal number can't be accepted."""
+
+        self.stubs.UnsetAll()
+        self.assertRaises(exception.InvalidInput, flavors.create, "abc",
+                          -512, 2, 1, 1, 1234, 512, 1, True)
+        self.assertRaises(exception.InvalidInput, flavors.create, "abcd",
+                          512.2, 2, 1, 1, 1234, 512, 1, True)
+        self.assertRaises(exception.InvalidInput, flavors.create, "abcde",
+                          None, 2, 1, 1, 1234, 512, 1, True)
+        self.assertRaises(exception.InvalidInput, flavors.create, "abcdef",
+                          512, 2, None, 1, 1234, 512, 1, True)
+        self.assertRaises(exception.InvalidInput, flavors.create, "abcdef",
+                          "test_memory_mb", 2, None, 1, 1234, 512, 1, True)

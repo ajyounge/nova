@@ -18,6 +18,7 @@ Unit Tests for instance types extra specs code
 
 from nova import context
 from nova import db
+from nova import exception
 from nova import test
 
 
@@ -26,17 +27,17 @@ class InstanceTypeExtraSpecsTestCase(test.TestCase):
     def setUp(self):
         super(InstanceTypeExtraSpecsTestCase, self).setUp()
         self.context = context.get_admin_context()
-        values = dict(name="cg1.testxlarge",
+        values = dict(name="cg1.4xlarge",
                       memory_mb=22000,
                       vcpus=8,
                       root_gb=1690,
-                      ephemeral_gb=1690,
-                      flavorid=999)
+                      ephemeral_gb=2000,
+                      flavorid=105)
         specs = dict(cpu_arch="x86_64",
                         cpu_model="Nehalem",
-                        gpu_arch="fermi",
-                        gpus=2,
-                        gpu_model="Tesla 2050")
+                        xpu_arch="fermi",
+                        xpus=2,
+                        xpu_model="Tesla 2050")
         values['extra_specs'] = specs
         ref = db.instance_type_create(self.context,
                                           values)
@@ -45,15 +46,15 @@ class InstanceTypeExtraSpecsTestCase(test.TestCase):
 
     def tearDown(self):
         # Remove the instance type from the database
-        db.instance_type_destroy(self.context, "cg1.testxlarge")
+        db.instance_type_destroy(self.context, "cg1.4xlarge")
         super(InstanceTypeExtraSpecsTestCase, self).tearDown()
 
     def test_instance_type_specs_get(self):
         expected_specs = dict(cpu_arch="x86_64",
                                  cpu_model="Nehalem",
-                                 gpu_arch="fermi",
-                                 gpus="2",
-                                 gpu_model="Tesla 2050")
+                                 xpu_arch="fermi",
+                                 xpus="2",
+                                 xpu_model="Tesla 2050")
         actual_specs = db.instance_type_extra_specs_get(
                               self.context,
                               self.flavorid)
@@ -62,11 +63,11 @@ class InstanceTypeExtraSpecsTestCase(test.TestCase):
     def test_instance_type_extra_specs_delete(self):
         expected_specs = dict(cpu_arch="x86_64",
                                  cpu_model="Nehalem",
-                                 gpu_arch="fermi",
-                                 gpus="2")
+                                 xpu_arch="fermi",
+                                 xpus="2")
         db.instance_type_extra_specs_delete(self.context,
-                                      self.instance_type_id,
-                                      "gpu_model")
+                                      self.flavorid,
+                                      "xpu_model")
         actual_specs = db.instance_type_extra_specs_get(
                               self.context,
                               self.flavorid)
@@ -75,9 +76,9 @@ class InstanceTypeExtraSpecsTestCase(test.TestCase):
     def test_instance_type_extra_specs_update(self):
         expected_specs = dict(cpu_arch="x86_64",
                                  cpu_model="Sandy Bridge",
-                                 gpu_arch="fermi",
-                                 gpus="2",
-                                 gpu_model="Tesla 2050")
+                                 xpu_arch="fermi",
+                                 xpus="2",
+                                 xpu_model="Tesla 2050")
         db.instance_type_extra_specs_update_or_create(
                               self.context,
                               self.flavorid,
@@ -87,12 +88,19 @@ class InstanceTypeExtraSpecsTestCase(test.TestCase):
                               self.flavorid)
         self.assertEquals(expected_specs, actual_specs)
 
+    def test_instance_type_extra_specs_update_with_nonexisting_flavor(self):
+        extra_specs = dict(cpu_arch="x86_64")
+        nonexisting_flavorid = "some_flavor_that_doesnt_exists"
+        self.assertRaises(exception.FlavorNotFound,
+                          db.instance_type_extra_specs_update_or_create,
+                          self.context, nonexisting_flavorid, extra_specs)
+
     def test_instance_type_extra_specs_create(self):
         expected_specs = dict(cpu_arch="x86_64",
                                  cpu_model="Nehalem",
-                                 gpu_arch="fermi",
-                                 gpus="2",
-                                 gpu_model="Tesla 2050",
+                                 xpu_arch="fermi",
+                                 xpus="2",
+                                 xpu_model="Tesla 2050",
                                  net_arch="ethernet",
                                  net_mbps="10000")
         db.instance_type_extra_specs_update_or_create(
@@ -112,58 +120,52 @@ class InstanceTypeExtraSpecsTestCase(test.TestCase):
         self.assertEquals(instance_type['extra_specs'],
                           dict(cpu_arch="x86_64",
                                cpu_model="Nehalem",
-                               gpu_arch="fermi",
-                               gpus="2",
-                               gpu_model="Tesla 2050"))
-        instance_type = db.instance_type_get_by_name(
+                               xpu_arch="fermi",
+                               xpus="2",
+                               xpu_model="Tesla 2050"))
+        instance_type = db.instance_type_get(
                             self.context,
-                            "m1.small")
-        self.assertEquals(instance_type['extra_specs'],
-                          dict(hypervisor_type="s==QEMU",
-                               cpu_arch="s==x86_64"))
+                            5)
+        self.assertEquals(instance_type['extra_specs'], {})
 
     def test_instance_type_get_by_name_with_extra_specs(self):
         instance_type = db.instance_type_get_by_name(
                             self.context,
-                            "cg1.testxlarge")
+                            "cg1.4xlarge")
         self.assertEquals(instance_type['extra_specs'],
                           dict(cpu_arch="x86_64",
                                cpu_model="Nehalem",
-                               gpu_arch="fermi",
-                               gpus="2",
-                               gpu_model="Tesla 2050"))
+                               xpu_arch="fermi",
+                               xpus="2",
+                               xpu_model="Tesla 2050"))
 
         instance_type = db.instance_type_get_by_name(
                             self.context,
                             "m1.small")
-        self.assertEquals(instance_type['extra_specs'],
-                          dict(hypervisor_type="s==QEMU",
-                               cpu_arch="s==x86_64"))
+        self.assertEquals(instance_type['extra_specs'], {})
 
     def test_instance_type_get_by_flavor_id_with_extra_specs(self):
         instance_type = db.instance_type_get_by_flavor_id(
                             self.context,
-                            999)
+                            105)
         self.assertEquals(instance_type['extra_specs'],
                           dict(cpu_arch="x86_64",
                                cpu_model="Nehalem",
-                               gpu_arch="fermi",
-                               gpus="2",
-                               gpu_model="Tesla 2050"))
+                               xpu_arch="fermi",
+                               xpus="2",
+                               xpu_model="Tesla 2050"))
 
         instance_type = db.instance_type_get_by_flavor_id(
                             self.context,
                             2)
-        self.assertEquals(instance_type['extra_specs'],
-                          dict(hypervisor_type="s==QEMU",
-                               cpu_arch="s==x86_64"))
+        self.assertEquals(instance_type['extra_specs'], {})
 
     def test_instance_type_get_all(self):
         specs = dict(cpu_arch="x86_64",
                         cpu_model="Nehalem",
-                        gpu_arch="fermi",
-                        gpus='2',
-                        gpu_model="Tesla 2050")
+                        xpu_arch="fermi",
+                        xpus='2',
+                        xpu_model="Tesla 2050")
 
         types = db.instance_type_get_all(self.context)
 
@@ -172,7 +174,5 @@ class InstanceTypeExtraSpecsTestCase(test.TestCase):
             name = instance_type['name']
             name2specs[name] = instance_type['extra_specs']
 
-        self.assertEquals(name2specs['cg1.testxlarge'], specs)
-        self.assertEquals(name2specs['m1.small'],
-                          dict(hypervisor_type="s==QEMU",
-                               cpu_arch="s==x86_64"))
+        self.assertEquals(name2specs['cg1.4xlarge'], specs)
+        self.assertEquals(name2specs['m1.small'], {})

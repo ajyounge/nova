@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright 2011 OpenStack, LLC
+# Copyright 2011 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,10 +17,14 @@
 """vm_vdi_cleaner.py - List or clean orphaned VDIs/instances on XenServer."""
 
 import doctest
+import gettext
 import os
 import sys
+
+from oslo.config import cfg
 import XenAPI
 
+gettext.install('nova', unicode=1)
 
 possible_topdir = os.getcwd()
 if os.path.exists(os.path.join(possible_topdir, "nova", "__init__.py")):
@@ -30,14 +34,25 @@ if os.path.exists(os.path.join(possible_topdir, "nova", "__init__.py")):
 from nova import context
 from nova import db
 from nova import exception
-from nova import flags
-from nova.openstack.common import cfg
 from nova.openstack.common import timeutils
+from nova.virt import virtapi
 from nova.virt.xenapi import driver as xenapi_driver
 
+cleaner_opts = [
+    cfg.IntOpt('zombie_instance_updated_at_window',
+               default=172800,
+               help='Number of seconds zombie instances are cleaned up.'),
+]
+
+cli_opt = cfg.StrOpt('command',
+                     default=None,
+                     help='Cleaner command')
 
 CONF = cfg.CONF
-flags.DECLARE("resize_confirm_window", "nova.compute.manager")
+CONF.register_opts(cleaner_opts)
+CONF.register_cli_opt(cli_opt)
+CONF.import_opt('verbose', 'nova.openstack.common.log')
+CONF.import_opt("resize_confirm_window", "nova.compute.manager")
 
 
 ALLOWED_COMMANDS = ["list-vdis", "clean-vdis", "list-instances",
@@ -45,7 +60,7 @@ ALLOWED_COMMANDS = ["list-vdis", "clean-vdis", "list-instances",
 
 
 def call_xenapi(xenapi, method, *args):
-    """Make a call to xapi"""
+    """Make a call to xapi."""
     return xenapi._session.call_xenapi(method, *args)
 
 
@@ -273,19 +288,21 @@ def clean_orphaned_instances(xenapi, orphaned_instances):
 
 def main():
     """Main loop."""
-    args = CONF(args=sys.argv,
-                usage='%prog [options] [' + '|'.join(ALLOWED_COMMANDS) + ']')
-    if len(args) < 2:
+    args = CONF(args=sys.argv[1:], usage='%(prog)s [options] --command={' +
+            '|'.join(ALLOWED_COMMANDS) + '}')
+
+    command = CONF.command
+    if not command or command not in ALLOWED_COMMANDS:
         CONF.print_usage()
         sys.exit(1)
-
-    command = args[1]
 
     if CONF.zombie_instance_updated_at_window < CONF.resize_confirm_window:
         raise Exception("`zombie_instance_updated_at_window` has to be longer"
                 " than `resize_confirm_window`.")
 
-    xenapi = xenapi_driver.XenAPIDriver()
+    # NOTE(blamar) This tool does not require DB access, so passing in the
+    # 'abstract' VirtAPI class is acceptable
+    xenapi = xenapi_driver.XenAPIDriver(virtapi.VirtAPI())
 
     if command == "list-vdis":
         if CONF.verbose:

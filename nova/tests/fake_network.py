@@ -15,20 +15,27 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+from oslo.config import cfg
+
 from nova.compute import api as compute_api
 from nova.compute import manager as compute_manager
 import nova.context
 from nova import db
 from nova import exception
-from nova import flags
+from nova.network import api as network_api
 from nova.network import manager as network_manager
 from nova.network import model as network_model
 from nova.network import nova_ipam_lib
-from nova import utils
+from nova.network import rpcapi as network_rpcapi
+from nova.objects import base as obj_base
+from nova.objects import instance_info_cache
+from nova.openstack.common import jsonutils
+from nova.virt.libvirt import config as libvirt_config
 
 
 HOST = "testhost"
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
+CONF.import_opt('use_ipv6', 'nova.netconf')
 
 
 class FakeIptablesFirewallDriver(object):
@@ -44,25 +51,30 @@ class FakeIptablesFirewallDriver(object):
 
 class FakeVIFDriver(object):
 
-    def __init__(self, **kwargs):
+    def __init__(self, *args, **kwargs):
         pass
 
     def setattr(self, key, val):
         self.__setattr__(key, val)
 
-    def plug(self, instance, network, mapping):
-        return {
-            'id': 'fake',
-            'bridge_name': 'fake',
-            'mac_address': 'fake',
-            'ip_address': 'fake',
-            'dhcp_server': 'fake',
-            'extra_params': 'fake',
-        }
+    def get_config(self, instance, network, mapping, image_meta):
+        conf = libvirt_config.LibvirtConfigGuestInterface()
+
+        for attr, val in conf.__dict__.iteritems():
+            if val is None:
+                setattr(conf, attr, 'fake')
+
+        return conf
+
+    def plug(self, instance, vif):
+        pass
+
+    def unplug(self, instance, vif):
+        pass
 
 
 class FakeModel(dict):
-    """Represent a model from the db"""
+    """Represent a model from the db."""
     def __init__(self, *args, **kwargs):
         self.update(kwargs)
 
@@ -111,7 +123,7 @@ class FakeNetworkManager(network_manager.NetworkManager):
                     dict(address='10.0.0.2')]
 
         def network_get_by_cidr(self, context, cidr):
-            raise exception.NetworkNotFoundForCidr()
+            raise exception.NetworkNotFoundForCidr(cidr=cidr)
 
         def network_create_safe(self, context, net):
             fakenet = dict(net)
@@ -122,7 +134,7 @@ class FakeNetworkManager(network_manager.NetworkManager):
             return {'cidr_v6': '2001:db8:69:%x::/64' % network_id}
 
         def network_get_by_uuid(self, context, network_uuid):
-            raise exception.NetworkNotFoundForUUID()
+            raise exception.NetworkNotFoundForUUID(uuid=network_uuid)
 
         def network_get_all(self, context):
             raise exception.NoNetworksFound()
@@ -140,10 +152,14 @@ class FakeNetworkManager(network_manager.NetworkManager):
             return [ip for ip in self.fixed_ips
                     if ip['virtual_interface_id'] == vif_id]
 
+        def fixed_ip_disassociate(self, context, address):
+            return True
+
     def __init__(self):
         self.db = self.FakeDB()
         self.deallocate_called = None
         self.deallocate_fixed_ip_calls = []
+        self.network_rpcapi = network_rpcapi.NetworkAPI()
 
     # TODO(matelakat) method signature should align with the faked one's
     def deallocate_fixed_ip(self, context, address=None, host=None):
@@ -154,10 +170,14 @@ class FakeNetworkManager(network_manager.NetworkManager):
     def _create_fixed_ips(self, context, network_id, fixed_cidr=None):
         pass
 
+    def get_instance_nw_info(context, instance_id, rxtx_factor,
+                             host, instance_uuid=None, **kwargs):
+        pass
+
 
 def fake_network(network_id, ipv6=None):
     if ipv6 is None:
-        ipv6 = FLAGS.use_ipv6
+        ipv6 = CONF.use_ipv6
     fake_network = {'id': network_id,
              'uuid': '00000000-0000-0000-0000-00000000000000%02d' % network_id,
              'label': 'test%d' % network_id,
@@ -184,7 +204,7 @@ def fake_network(network_id, ipv6=None):
         fake_network['cidr_v6'] = '2001:db8:0:%x::/64' % network_id
         fake_network['gateway_v6'] = '2001:db8:0:%x::1' % network_id
         fake_network['netmask_v6'] = '64'
-    if FLAGS.flat_injected:
+    if CONF.flat_injected:
         fake_network['injected'] = True
 
     return fake_network
@@ -351,7 +371,7 @@ def fake_get_instance_nw_info(stubs, num_networks=1, ips_per_vif=2,
 
     nw_model = network.get_instance_nw_info(
                 FakeContext('fakeuser', 'fake_project'),
-                0, 0, 3, None)
+                0, 3, None)
     if spectacular:
         return nw_model
     return nw_model.legacy()
@@ -362,9 +382,8 @@ def stub_out_nw_api_get_instance_nw_info(stubs, func=None,
                                          ips_per_vif=1,
                                          floating_ips_per_fixed_ip=0,
                                          spectacular=False):
-    import nova.network
 
-    def get_instance_nw_info(self, context, instance):
+    def get_instance_nw_info(self, context, instance, conductor_api=None):
         return fake_get_instance_nw_info(stubs, num_networks=num_networks,
                         ips_per_vif=ips_per_vif,
                         floating_ips_per_fixed_ip=floating_ips_per_fixed_ip,
@@ -372,7 +391,7 @@ def stub_out_nw_api_get_instance_nw_info(stubs, func=None,
 
     if func is None:
         func = get_instance_nw_info
-    stubs.Set(nova.network.API, 'get_instance_nw_info', func)
+    stubs.Set(network_api.API, 'get_instance_nw_info', func)
 
 
 _real_functions = {}
@@ -390,8 +409,11 @@ def set_stub_network_methods(stubs):
     def fake_networkinfo(*args, **kwargs):
         return network_model.NetworkInfo()
 
+    def fake_async_networkinfo(*args, **kwargs):
+        return network_model.NetworkInfoAsyncWrapper(fake_networkinfo)
+
     stubs.Set(cm, '_get_instance_nw_info', fake_networkinfo)
-    stubs.Set(cm, '_allocate_network', fake_networkinfo)
+    stubs.Set(cm, '_allocate_network', fake_async_networkinfo)
     stubs.Set(cm, '_deallocate_network', lambda *args, **kwargs: None)
 
 
@@ -433,11 +455,11 @@ def _get_fake_cache():
                          'label': 'private',
                          'subnets': [{'cidr': '192.168.0.0/24',
                                       'ips': [_ip('192.168.0.3')]}]}}]
-    if FLAGS.use_ipv6:
+    if CONF.use_ipv6:
         ipv6_addr = 'fe80:b33f::a8bb:ccff:fedd:eeff'
         info[0]['network']['subnets'].append({'cidr': 'fe80:b33f::/64',
                                               'ips': [_ip(ipv6_addr)]})
-    return info
+    return jsonutils.dumps(info)
 
 
 def _get_instances_with_cached_ips(orig_func, *args, **kwargs):
@@ -445,9 +467,22 @@ def _get_instances_with_cached_ips(orig_func, *args, **kwargs):
     entries
     """
     instances = orig_func(*args, **kwargs)
-    if isinstance(instances, list):
+    context = args[0]
+
+    def _info_cache_for(instance):
+        info_cache = {'network_info': _get_fake_cache(),
+                      'instance_uuid': instance['uuid']}
+        if isinstance(instance, obj_base.NovaObject):
+            _info_cache = instance_info_cache.InstanceInfoCache()
+            instance_info_cache.InstanceInfoCache._from_db_object(context,
+                                                                  _info_cache,
+                                                                  info_cache)
+            info_cache = _info_cache
+        instance['info_cache'] = info_cache
+
+    if isinstance(instances, (list, obj_base.ObjectListBase)):
         for instance in instances:
-            instance['info_cache'] = {'network_info': _get_fake_cache()}
+            _info_cache_for(instance)
     else:
-        instances['info_cache'] = {'network_info': _get_fake_cache()}
+        _info_cache_for(instances)
     return instances

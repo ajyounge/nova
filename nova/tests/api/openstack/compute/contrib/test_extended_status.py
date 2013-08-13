@@ -1,4 +1,4 @@
-# Copyright 2011 OpenStack LLC.
+# Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,14 +19,9 @@ import webob
 from nova.api.openstack.compute.contrib import extended_status
 from nova import compute
 from nova import exception
-from nova import flags
 from nova.openstack.common import jsonutils
 from nova import test
 from nova.tests.api.openstack import fakes
-
-
-FLAGS = flags.FLAGS
-
 
 UUID1 = '00000000-0000-0000-0000-000000000001'
 UUID2 = '00000000-0000-0000-0000-000000000002'
@@ -56,11 +51,15 @@ class ExtendedStatusTest(test.TestCase):
         fakes.stub_out_nw_api(self.stubs)
         self.stubs.Set(compute.api.API, 'get', fake_compute_get)
         self.stubs.Set(compute.api.API, 'get_all', fake_compute_get_all)
+        self.flags(
+            osapi_compute_extension=[
+                'nova.api.openstack.compute.contrib.select_extensions'],
+            osapi_compute_ext_list=['Extended_status'])
 
     def _make_request(self, url):
         req = webob.Request.blank(url)
         req.headers['Accept'] = self.content_type
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(fakes.wsgi_app(init_only=('servers',)))
         return res
 
     def _get_server(self, body):
@@ -99,7 +98,7 @@ class ExtendedStatusTest(test.TestCase):
     def test_no_instance_passthrough_404(self):
 
         def fake_compute_get(*args, **kwargs):
-            raise exception.InstanceNotFound()
+            raise exception.InstanceNotFound(instance_id='fake')
 
         self.stubs.Set(compute.api.API, 'get', fake_compute_get)
         url = '/v2/fake/servers/70f6db34-de8d-4fbd-aafb-4065bdfa6115'

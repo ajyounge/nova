@@ -10,8 +10,6 @@
             "maxTotalInstances": 10,
             "maxTotalKeypairs": 100,
             "maxTotalRAMSize": 51200,
-            "maxTotalVolumeGigabytes": 1000,
-            "maxTotalVolumes": 10,
             "maxSecurityGroups": 10,
             "maxSecurityGroupRules": 20
         },
@@ -68,6 +66,19 @@
                 ],
                 "regex": ".*changes-since.*",
                 "uri": "*changes-since*"
+            },
+            {
+                "limit": [
+                    {
+                        "next-available": "%(timestamp)s",
+                        "remaining": 12,
+                        "unit": "HOUR",
+                        "value": 12,
+                        "verb": "GET"
+                    }
+                ],
+                "regex": "^/os-fping",
+                "uri": "*/os-fping"
             }
         ]
     }

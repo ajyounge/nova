@@ -18,17 +18,17 @@
 Unit Tests for nova.scheduler.rpcapi
 """
 
+from oslo.config import cfg
+
 from nova import context
-from nova import flags
 from nova.openstack.common import rpc
 from nova.scheduler import rpcapi as scheduler_rpcapi
 from nova import test
 
+CONF = cfg.CONF
 
-FLAGS = flags.FLAGS
 
-
-class SchedulerRpcAPITestCase(test.TestCase):
+class SchedulerRpcAPITestCase(test.NoDBTestCase):
     def _test_scheduler_api(self, method, rpc_method, **kwargs):
         ctxt = context.RequestContext('fake_user', 'fake_project')
         rpcapi = scheduler_rpcapi.SchedulerAPI()
@@ -51,7 +51,7 @@ class SchedulerRpcAPITestCase(test.TestCase):
         retval = getattr(rpcapi, method)(ctxt, **kwargs)
 
         self.assertEqual(retval, expected_retval)
-        expected_args = [ctxt, FLAGS.scheduler_topic, expected_msg]
+        expected_args = [ctxt, CONF.scheduler_topic, expected_msg]
         for arg, expected_arg in zip(self.fake_args, expected_args):
             self.assertEqual(arg, expected_arg)
 
@@ -69,10 +69,6 @@ class SchedulerRpcAPITestCase(test.TestCase):
                 request_spec='fake_request_spec',
                 filter_properties='fake_props', reservations=list('fake_res'))
 
-    def test_show_host_resources(self):
-        self._test_scheduler_api('show_host_resources', rpc_method='call',
-                host='fake_host')
-
     def test_live_migration(self):
         self._test_scheduler_api('live_migration', rpc_method='call',
                 block_migration='fake_block_migration',
@@ -82,10 +78,11 @@ class SchedulerRpcAPITestCase(test.TestCase):
     def test_update_service_capabilities(self):
         self._test_scheduler_api('update_service_capabilities',
                 rpc_method='fanout_cast', service_name='fake_name',
-                host='fake_host', capabilities='fake_capabilities')
+                host='fake_host', capabilities='fake_capabilities',
+                version='2.4')
 
-    def test_create_volume(self):
-        self._test_scheduler_api('create_volume',
-                rpc_method='cast', volume_id="fake_volume",
-                snapshot_id="fake_snapshots", image_id="fake_image",
-                version='2.2')
+    def test_select_hosts(self):
+        self._test_scheduler_api('select_hosts', rpc_method='call',
+                request_spec='fake_request_spec',
+                filter_properties='fake_prop',
+                version='2.6')

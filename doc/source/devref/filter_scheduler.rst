@@ -32,10 +32,16 @@ There are some standard filter classes to use (:mod:`nova.scheduler.filters`):
   image properties contained in the instance.
 * |AvailabilityZoneFilter| - filters hosts by availability zone. It passes
   hosts matching the availability zone specified in the instance properties.
-* |ComputeCapabilityFilter| - checks that the capabilities provided by the
+* |ComputeCapabilitiesFilter| - checks that the capabilities provided by the
   host compute service satisfy any extra specifications associated with the
-  instance type (that have no scope, see |TrustedFilter| for details).  It
-  passes hosts that can create the specified instance type.
+  instance type.  It passes hosts that can create the specified instance type.
+
+  The extra specifications can have a scope at the beginning of the key string
+  of a key/value pair. The scope format is "scope:key" and can be nested,
+  i.e. key_string := scope:key_string. Example like "capabilities:cpu_info:
+  features" is valid scope format. A key string without any ':' is non-scope
+  format. Each filter defines it's valid scope, and not all filters accept
+  non-scope format.
 
   The extra specifications can have an operator at the beginning of the value
   string of a key/value pair. If there is no operator specified, then a
@@ -63,15 +69,25 @@ There are some standard filter classes to use (:mod:`nova.scheduler.filters`):
   satisfies any extra specifications associated with the instance type (that
   have no scope).  It passes hosts that can create the specified instance type.
   The extra specifications can have the same operators as
-  |ComputeCapabilityFilter|.
+  |ComputeCapabilitiesFilter|.
 * |ComputeFilter| - passes all hosts that are operational and enabled.
 * |CoreFilter| - filters based on CPU core utilization. It passes hosts with
   sufficient number of CPU cores.
+* |AggregateCoreFilter| - filters hosts by CPU core number with per-aggregate
+  cpu_allocation_ratio setting. If no per-aggregate value is found, it will
+  fall back to the global default cpu_allocation_ratio. If more than one value
+  is found for a host (meaning the host is in two differenet aggregate with
+  different ratio settings), the minimum value will be used.
 * |IsolatedHostsFilter| - filter based on "image_isolated" and "host_isolated"
   flags.
 * |JsonFilter| - allows simple JSON-based grammar for selecting hosts.
 * |RamFilter| - filters hosts by their RAM. Only hosts with sufficient RAM
   to host the instance are passed.
+* |AggregateRamFilter| - filters hosts by RAM with per-aggregate
+  ram_allocation_ratio setting. If no per-aggregate value is found, it will
+  fall back to the global default ram_allocation_ratio. If more than one value
+  is found for a host (meaning the host is in two differenet aggregate with
+  different ratio settings), the minimum value will be used.
 * |SimpleCIDRAffinityFilter| - allows to put a new instance on a host within
   the same IP block.
 * |DifferentHostFilter| - allows to put the instance on a different host from a
@@ -85,6 +101,9 @@ There are some standard filter classes to use (:mod:`nova.scheduler.filters`):
 * |TypeAffinityFilter| - Only passes hosts that are not already running an
   instance of the requested type.
 * |AggregateTypeAffinityFilter| - limits instance_type by aggregate.
+* |GroupAntiAffinityFilter| - ensures that each instance in group is on a
+  different host.
+* |AggregateMultiTenancyIsolation| - isolate tenants in specific aggregates.
 
 Now we can focus on these standard filter classes in details. I will pass the
 simplest ones, such as |AllHostsFilter|, |CoreFilter| and |RamFilter| are,
@@ -128,11 +147,14 @@ hypervisor_type=qemu`
 Only hosts that satisfy these requirements will pass the
 |ImagePropertiesFilter|.
 
-|ComputeCapabilitesFilter| checks if the host satisfies any 'extra specs'
-specified on the instance type.  The 'extra specs' can contain key/value pairs,
-and the |ComputeCapabilitiesFilter| will only pass hosts whose capabilities
-satisfy the requested specifications.  All hosts are passed if no 'extra specs'
-are specified.
+|ComputeCapabilitiesFilter| checks if the host satisfies any 'extra specs'
+specified on the instance type.  The 'extra specs' can contain key/value pairs.
+The key for the filter is either non-scope format (i.e. no ':' contained), or
+scope format in capabilities scope (i.e. 'capabilities:xxx:yyy'). One example
+of capabilities scope is "capabilities:cpu_info:features", which will match
+host's cpu features capabilities. The |ComputeCapabilitiesFilter| will only
+pass hosts whose capabilities satisfy the requested specifications.  All hosts
+are passed if no 'extra specs' are specified.
 
 |ComputeFilter| is quite simple and passes any host whose compute service is
 enabled and operational.
@@ -153,6 +175,10 @@ of the set of instances uses.
 |SimpleCIDRAffinityFilter| looks at the subnet mask and investigates if
 the network address of the current host is in the same sub network as it was
 defined in the request.
+
+|GroupAntiAffinityFilter| its method `host_passes` returns `True` if host to
+place the instance on is not in a group of hosts. The group of hosts is
+maintained by a group name. The scheduler hint contains the group name.
 
 |JsonFilter| - this filter provides the opportunity to write complicated
 queries for the hosts capabilities filtering, based on simple JSON-like syntax.
@@ -179,9 +205,9 @@ The |RetryFilter| filters hosts that have already been attempted for scheduling.
 It only passes hosts that have not been previously attempted.
 
 The |TrustedFilter| filters hosts based on their trust.  Only passes hosts
-that match the trust requested in the `extra_specs' for the flavor.  The key
-for this filter is `trust:trusted_host', where `trust' is the scope of the
-key and `trusted_host' is the actual key value'.
+that match the trust requested in the `extra_specs' for the flavor. The key
+for this filter must be scope format as `trust:trusted_host', where `trust'
+is the scope of the key and `trusted_host' is the actual key value.
 The value of this pair (`trusted'/`untrusted') must match the
 integrity of a host (obtained from the Attestation service) before it is
 passed by the |TrustedFilter|.
@@ -198,11 +224,11 @@ The default values for these settings in nova.conf are:
 ::
 
     --scheduler_available_filters=nova.scheduler.filters.standard_filters
-    --scheduler_default_filters=RamFilter,ComputeFilter,AvailabilityZoneFilter,ComputeCapabilityFilter,ImagePropertiesFilter
+    --scheduler_default_filters=RamFilter,ComputeFilter,AvailabilityZoneFilter,ComputeCapabilitiesFilter,ImagePropertiesFilter
 
 With this configuration, all filters in `nova.scheduler.filters`
 would be available, and by default the |RamFilter|, |ComputeFilter|,
-|AvailabilityZoneFilter|, |ComputeCapabilityFilter|, and
+|AvailabilityZoneFilter|, |ComputeCapabilitiesFilter|, and
 |ImagePropertiesFilter| would be used.
 
 If you want to create **your own filter** you just need to inherit from
@@ -240,67 +266,10 @@ putting instance on an appropriate host would have low.
 
 So let's find out, how does all this computing work happen.
 
-Before weighting Filter Scheduler creates the list of tuples containing weights
-and cost functions to use for weighing hosts. These functions can be got from
-cache, if this operation had been done before (this cache depends on `topic` of
-node, Filter Scheduler works with only the Compute Nodes, so the topic would be
-"`compute`" here). If there is no cost functions in cache associated with
-"compute", Filter Scheduler tries to get these cost functions from `nova.conf`.
-Weight in tuple means weight of cost function matching with it. It also can be
-got from `nova.conf`. After that Scheduler weights host, using selected cost
-functions. It does this using `weighted_sum` method, which parameters are:
-
-* `weighted_fns` - list of cost functions created with their weights;
-* `host_states` - hosts to be weighted;
-* `weighing_properties` - dictionary of values that can influence weights.
-
-This method firstly creates a grid of function results (it just counts value of
-each function using `host_state` and `weighing_properties`) - `scores`, where
-it would be one row per host and one function per column. The next step is to
-multiply value from the each cell of the grid by the weight of appropriate cost
-function. And the final step is to sum values in the each row - it would be the
-weight of host, described in this line. This method returns the host with the
-lowest weight - the best one.
-
-If we concentrate on cost functions, it would be important to say that we use
-`compute_fill_first_cost_fn` function by default, which simply returns hosts
-free RAM:
-
-::
-
-    def compute_fill_first_cost_fn(host_state, weighing_properties):
-        """More free ram = higher weight. So servers will less free ram will be
-           preferred."""
-        return host_state.free_ram_mb
-
-You can implement your own variant of cost function for the hosts capabilities
-you would like to mention. Using different cost functions (as you understand,
-there can be a lot of ones used in the same time) can make the chose of next
-host for the creating of the new instance flexible.
-
-These cost functions should be set up in the `nova.conf` with the flag
-`least_cost_functions` (there can be more than one functions separated by
-commas). By default this line would look like this:
-
-::
-
-    --least_cost_functions=nova.scheduler.least_cost.compute_fill_first_cost_fn
-
-As for weights of cost functions, they also should be described in `nova.conf`.
-The line with this description looks the following way:
-**function_name_weight**.
-
-As for default cost function, it would be: `compute_fill_first_cost_fn_weight`,
-and by default it is -1.0.
-
-::
-
-    --compute_fill_first_cost_fn_weight=-1.0
-
-Negative function's weight means that the more free RAM Compute Node has, the
-better it is. Nova tries to spread instances as much as possible over the
-Compute Nodes. Positive weight here would mean that Nova would fill up a single
-Compute Node first.
+The Filter Scheduler weights hosts based on the config option
+`scheduler_weight_classes`, this defaults to
+`nova.scheduler.weights.all_weighers`, which selects the only weigher available
+-- the RamWeigher. Hosts are then weighted and sorted with the largest weight winning.
 
 Filter Scheduler finds local list of acceptable hosts by repeated filtering and
 weighing. Each time it chooses a host, it virtually consumes resources on it,
@@ -323,13 +292,18 @@ in :mod:`nova.tests.scheduler`.
 .. |ComputeCapabilitiesFilter| replace:: :class:`ComputeCapabilitiesFilter <nova.scheduler.filters.compute_capabilities_filter.ComputeCapabilitiesFilter>`
 .. |ComputeFilter| replace:: :class:`ComputeFilter <nova.scheduler.filters.compute_filter.ComputeFilter>`
 .. |CoreFilter| replace:: :class:`CoreFilter <nova.scheduler.filters.core_filter.CoreFilter>`
+.. |AggregateCoreFilter| replace:: :class:`AggregateCoreFilter <nova.scheduler.filters.core_filter.AggregateCoreFilter>`
 .. |IsolatedHostsFilter| replace:: :class:`IsolatedHostsFilter <nova.scheduler.filters.isolated_hosts_filter>`
 .. |JsonFilter| replace:: :class:`JsonFilter <nova.scheduler.filters.json_filter.JsonFilter>`
 .. |RamFilter| replace:: :class:`RamFilter <nova.scheduler.filters.ram_filter.RamFilter>`
+.. |AggregateRamFilter| replace:: :class:`AggregateRamFilter <nova.scheduler.filters.ram_filter.AggregateRamFilter>`
 .. |SimpleCIDRAffinityFilter| replace:: :class:`SimpleCIDRAffinityFilter <nova.scheduler.filters.affinity_filter.SimpleCIDRAffinityFilter>`
+.. |GroupAntiAffinityFilter| replace:: :class:`GroupAntiAffinityFilter <nova.scheduler.filters.affinity_filter.GroupAntiAffinityFilter>`
 .. |DifferentHostFilter| replace:: :class:`DifferentHostFilter <nova.scheduler.filters.affinity_filter.DifferentHostFilter>`
 .. |SameHostFilter| replace:: :class:`SameHostFilter <nova.scheduler.filters.affinity_filter.SameHostFilter>`
 .. |RetryFilter| replace:: :class:`RetryFilter <nova.scheduler.filters.retry_filter.RetryFilter>`
 .. |TrustedFilter| replace:: :class:`TrustedFilter <nova.scheduler.filters.trusted_filter.TrustedFilter>`
 .. |TypeAffinityFilter| replace:: :class:`TypeAffinityFilter <nova.scheduler.filters.type_filter.TypeAffinityFilter>`
 .. |AggregateTypeAffinityFilter| replace:: :class:`AggregateTypeAffinityFilter <nova.scheduler.filters.type_filter.AggregateTypeAffinityFilter>`
+.. |AggregateInstanceExtraSpecsFilter| replace:: :class:`AggregateInstanceExtraSpecsFilter <nova.scheduler.filters.aggregate_instance_extra_specs.AggregateInstanceExtraSpecsFilter>`
+.. |AggregateMultiTenancyIsolation| replace:: :class:`AggregateMultiTenancyIsolation <nova.scheduler.filters.aggregate_multitenancy_isolation.AggregateMultiTenancyIsolation>`

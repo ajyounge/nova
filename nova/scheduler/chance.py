@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010 OpenStack, LLC.
+# Copyright (c) 2010 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -23,15 +23,22 @@ Chance (Random) Scheduler implementation
 
 import random
 
+from oslo.config import cfg
+
+from nova.compute import rpcapi as compute_rpcapi
 from nova import exception
-from nova import flags
 from nova.scheduler import driver
 
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
+CONF.import_opt('compute_topic', 'nova.compute.rpcapi')
 
 
 class ChanceScheduler(driver.Scheduler):
     """Implements Scheduler as a random node selector."""
+
+    def __init__(self, *args, **kwargs):
+        super(ChanceScheduler, self).__init__(*args, **kwargs)
+        self.compute_rpcapi = compute_rpcapi.ComputeAPI()
 
     def _filter_hosts(self, request_spec, hosts, filter_properties):
         """Filter a list of hosts based on request_spec."""
@@ -54,21 +61,30 @@ class ChanceScheduler(driver.Scheduler):
             msg = _("Could not find another compute")
             raise exception.NoValidHost(reason=msg)
 
-        return hosts[int(random.random() * len(hosts))]
+        return random.choice(hosts)
+
+    def select_hosts(self, context, request_spec, filter_properties):
+        """Selects a set of random hosts."""
+        hosts = [self._schedule(context, CONF.compute_topic,
+            request_spec, filter_properties)
+            for instance_uuid in request_spec.get('instance_uuids', [])]
+        if not hosts:
+            raise exception.NoValidHost(reason="")
+        return hosts
 
     def schedule_run_instance(self, context, request_spec,
                               admin_password, injected_files,
                               requested_networks, is_first_time,
                               filter_properties):
-        """Create and run an instance or instances"""
+        """Create and run an instance or instances."""
         instance_uuids = request_spec.get('instance_uuids')
         for num, instance_uuid in enumerate(instance_uuids):
             request_spec['instance_properties']['launch_index'] = num
             try:
-                host = self._schedule(context, 'compute', request_spec,
-                                      filter_properties)
+                host = self._schedule(context, CONF.compute_topic,
+                                      request_spec, filter_properties)
                 updated_instance = driver.instance_update_db(context,
-                        instance_uuid, host)
+                        instance_uuid)
                 self.compute_rpcapi.run_instance(context,
                         instance=updated_instance, host=host,
                         requested_networks=requested_networks,
@@ -88,15 +104,7 @@ class ChanceScheduler(driver.Scheduler):
                              filter_properties, instance, instance_type,
                              reservations):
         """Select a target for resize."""
-        host = self._schedule(context, 'compute', request_spec,
+        host = self._schedule(context, CONF.compute_topic, request_spec,
                               filter_properties)
         self.compute_rpcapi.prep_resize(context, image, instance,
                 instance_type, host, reservations)
-
-    def schedule_create_volume(self, context, volume_id, snapshot_id,
-                               image_id):
-        """Picks a host that is up at random."""
-        host = self._schedule(context, FLAGS.volume_topic, None, {})
-        driver.cast_to_host(context, FLAGS.volume_topic, host, 'create_volume',
-                            volume_id=volume_id, snapshot_id=snapshot_id,
-                            image_id=image_id)

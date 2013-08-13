@@ -1,4 +1,4 @@
-# Copyright 2011 OpenStack LLC.
+# Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -14,35 +14,36 @@
 #    under the License.
 
 from lxml import etree
+from oslo.config import cfg
 
 from nova.api.openstack.compute.contrib import cloudpipe
 from nova.api.openstack import wsgi
 from nova.compute import utils as compute_utils
 from nova import db
-from nova import flags
 from nova.openstack.common import timeutils
 from nova import test
 from nova.tests.api.openstack import fakes
 from nova.tests import fake_network
+from nova.tests import matchers
 from nova import utils
 
-
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
+CONF.import_opt('vpn_image_id', 'nova.cloudpipe.pipelib')
 
 
 def fake_vpn_instance():
     return {
-        'id': 7, 'image_ref': FLAGS.vpn_image_id, 'vm_state': 'active',
+        'id': 7, 'image_ref': CONF.vpn_image_id, 'vm_state': 'active',
         'created_at': timeutils.parse_strtime('1981-10-20T00:00:00.000000'),
         'uuid': 7777, 'project_id': 'other',
     }
 
 
-def compute_api_get_all_empty(context):
+def compute_api_get_all_empty(context, search_opts=None):
     return []
 
 
-def compute_api_get_all(context):
+def compute_api_get_all(context, search_opts=None):
         return [fake_vpn_instance()]
 
 
@@ -108,7 +109,7 @@ class CloudpipeTest(test.TestCase):
                                     'state': 'running',
                                     'instance_id': 7777,
                                     'created_at': '1981-10-20T00:00:00Z'}]}
-        self.assertDictMatch(res_dict, response)
+        self.assertThat(res_dict, matchers.DictMatches(response))
 
     def test_cloudpipe_create(self):
         def launch_vpn_instance(context):

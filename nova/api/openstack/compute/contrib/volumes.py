@@ -17,7 +17,6 @@
 
 import webob
 from webob import exc
-from xml.dom import minidom
 
 from nova.api.openstack import common
 from nova.api.openstack import extensions
@@ -25,16 +24,16 @@ from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import compute
 from nova import exception
-from nova import flags
 from nova.openstack.common import log as logging
-from nova import utils
+from nova.openstack.common import strutils
+from nova.openstack.common import uuidutils
 from nova import volume
-from nova.volume import volume_types
-
 
 LOG = logging.getLogger(__name__)
-FLAGS = flags.FLAGS
 authorize = extensions.extension_authorizer('compute', 'volumes')
+
+authorize_attach = extensions.extension_authorizer('compute',
+                                                   'volume_attachments')
 
 
 def _translate_volume_detail_view(context, vol):
@@ -130,20 +129,20 @@ class CommonDeserializer(wsgi.MetadataXMLDeserializer):
 
     def _extract_volume(self, node):
         """Marshal the volume attribute of a parsed request."""
-        volume = {}
+        vol = {}
         volume_node = self.find_first_child_named(node, 'volume')
 
         attributes = ['display_name', 'display_description', 'size',
                       'volume_type', 'availability_zone']
         for attr in attributes:
             if volume_node.getAttribute(attr):
-                volume[attr] = volume_node.getAttribute(attr)
+                vol[attr] = volume_node.getAttribute(attr)
 
         metadata_node = self.find_first_child_named(volume_node, 'metadata')
         if metadata_node is not None:
-            volume['metadata'] = self.extract_metadata(metadata_node)
+            vol['metadata'] = self.extract_metadata(metadata_node)
 
-        return volume
+        return vol
 
 
 class CreateDeserializer(CommonDeserializer):
@@ -155,9 +154,9 @@ class CreateDeserializer(CommonDeserializer):
 
     def default(self, string):
         """Deserialize an xml-formatted volume create request."""
-        dom = minidom.parseString(string)
-        volume = self._extract_volume(dom)
-        return {'body': {'volume': volume}}
+        dom = xmlutil.safe_minidom_parse_string(string)
+        vol = self._extract_volume(dom)
+        return {'body': {'volume': vol}}
 
 
 class VolumeController(wsgi.Controller):
@@ -188,8 +187,7 @@ class VolumeController(wsgi.Controller):
         LOG.audit(_("Delete volume with id: %s"), id, context=context)
 
         try:
-            volume = self.volume_api.get(context, id)
-            self.volume_api.delete(context, volume)
+            self.volume_api.delete(context, id)
         except exception.NotFound:
             raise exc.HTTPNotFound()
         return webob.Response(status_int=202)
@@ -227,12 +225,6 @@ class VolumeController(wsgi.Controller):
         vol = body['volume']
 
         vol_type = vol.get('volume_type', None)
-        if vol_type:
-            try:
-                vol_type = volume_types.get_volume_type_by_name(context,
-                                                                vol_type)
-            except exception.NotFound:
-                raise exc.HTTPNotFound()
 
         metadata = vol.get('metadata', None)
 
@@ -251,15 +243,19 @@ class VolumeController(wsgi.Controller):
 
         availability_zone = vol.get('availability_zone', None)
 
-        new_volume = self.volume_api.create(context,
-                                            size,
-                                            vol.get('display_name'),
-                                            vol.get('display_description'),
-                                            snapshot=snapshot,
-                                            volume_type=vol_type,
-                                            metadata=metadata,
-                                            availability_zone=availability_zone
-                                           )
+        try:
+            new_volume = self.volume_api.create(
+                context,
+                size,
+                vol.get('display_name'),
+                vol.get('display_description'),
+                snapshot=snapshot,
+                volume_type=vol_type,
+                metadata=metadata,
+                availability_zone=availability_zone
+                )
+        except exception.InvalidInput as err:
+            raise exc.HTTPBadRequest(explanation=err.format_message())
 
         # TODO(vish): Instance should be None at db layer instead of
         #             trying to lazy load, but for now we turn it into
@@ -333,11 +329,14 @@ class VolumeAttachmentController(wsgi.Controller):
 
     def __init__(self):
         self.compute_api = compute.API()
+        self.volume_api = volume.API()
         super(VolumeAttachmentController, self).__init__()
 
     @wsgi.serializers(xml=VolumeAttachmentsTemplate)
     def index(self, req, server_id):
         """Returns the list of volume attachments for a given instance."""
+        context = req.environ['nova.context']
+        authorize_attach(context, action='index')
         return self._items(req, server_id,
                            entity_maker=_translate_attachment_summary_view)
 
@@ -346,6 +345,7 @@ class VolumeAttachmentController(wsgi.Controller):
         """Return data about the given volume attachment."""
         context = req.environ['nova.context']
         authorize(context)
+        authorize_attach(context, action='show')
 
         volume_id = id
         try:
@@ -375,11 +375,18 @@ class VolumeAttachmentController(wsgi.Controller):
             instance['uuid'],
             assigned_mountpoint)}
 
+    def _validate_volume_id(self, volume_id):
+        if not uuidutils.is_uuid_like(volume_id):
+            msg = _("Bad volumeId format: volumeId is "
+                    "not in proper format (%s)") % volume_id
+            raise exc.HTTPBadRequest(explanation=msg)
+
     @wsgi.serializers(xml=VolumeAttachmentTemplate)
     def create(self, req, server_id, body):
         """Attach a volume to an instance."""
         context = req.environ['nova.context']
         authorize(context)
+        authorize_attach(context, action='create')
 
         if not self.is_valid_body(body, 'volumeAttachment'):
             raise exc.HTTPUnprocessableEntity()
@@ -387,9 +394,14 @@ class VolumeAttachmentController(wsgi.Controller):
         volume_id = body['volumeAttachment']['volumeId']
         device = body['volumeAttachment'].get('device')
 
-        msg = _("Attach volume %(volume_id)s to instance %(server_id)s"
-                " at %(device)s") % locals()
-        LOG.audit(msg, context=context)
+        self._validate_volume_id(volume_id)
+
+        LOG.audit(_("Attach volume %(volume_id)s to instance %(server_id)s "
+                    "at %(device)s"),
+                  {'volume_id': volume_id,
+                   'device': device,
+                   'server_id': server_id},
+                  context=context)
 
         try:
             instance = self.compute_api.get(context, server_id)
@@ -397,6 +409,9 @@ class VolumeAttachmentController(wsgi.Controller):
                                                     volume_id, device)
         except exception.NotFound:
             raise exc.HTTPNotFound()
+        except exception.InstanceInvalidState as state_error:
+            common.raise_http_conflict_for_instance_invalid_state(state_error,
+                    'attach_volume')
 
         # The attach is async
         attachment = {}
@@ -424,6 +439,7 @@ class VolumeAttachmentController(wsgi.Controller):
         """Detach a volume from an instance."""
         context = req.environ['nova.context']
         authorize(context)
+        authorize_attach(context, action='delete')
 
         volume_id = id
         LOG.audit(_("Detach volume %s"), volume_id, context=context)
@@ -433,19 +449,29 @@ class VolumeAttachmentController(wsgi.Controller):
         except exception.NotFound:
             raise exc.HTTPNotFound()
 
-        bdms = self.compute_api.get_instance_bdms(context, instance)
+        volume = self.volume_api.get(context, volume_id)
 
+        bdms = self.compute_api.get_instance_bdms(context, instance)
         if not bdms:
             LOG.debug(_("Instance %s is not attached."), server_id)
             raise exc.HTTPNotFound()
 
         found = False
-        for bdm in bdms:
-            if bdm['volume_id'] == volume_id:
-                self.compute_api.detach_volume(context,
-                    volume_id=volume_id)
-                found = True
-                break
+        try:
+            for bdm in bdms:
+                if bdm['volume_id'] != volume_id:
+                    continue
+                try:
+                    self.compute_api.detach_volume(context, instance, volume)
+                    found = True
+                    break
+                except exception.VolumeUnattached:
+                    # The volume is not attached.  Treat it as NotFound
+                    # by falling through.
+                    pass
+        except exception.InstanceInvalidState as state_error:
+            common.raise_http_conflict_for_instance_invalid_state(state_error,
+                    'detach_volume')
 
         if not found:
             raise exc.HTTPNotFound()
@@ -553,8 +579,7 @@ class SnapshotController(wsgi.Controller):
         LOG.audit(_("Delete snapshot with id: %s"), id, context=context)
 
         try:
-            snapshot = self.volume_api.get_snapshot(context, id)
-            self.volume_api.delete_snapshot(context, snapshot)
+            self.volume_api.delete_snapshot(context, id)
         except exception.NotFound:
             return exc.HTTPNotFound()
         return webob.Response(status_int=202)
@@ -590,34 +615,32 @@ class SnapshotController(wsgi.Controller):
 
         snapshot = body['snapshot']
         volume_id = snapshot['volume_id']
-        volume = self.volume_api.get(context, volume_id)
+
+        LOG.audit(_("Create snapshot from volume %s"), volume_id,
+                  context=context)
 
         force = snapshot.get('force', False)
-        LOG.audit(_("Create snapshot from volume %s"), volume_id,
-                context=context)
-
-        if not utils.is_valid_boolstr(force):
-            msg = _("Invalid value '%s' for force. ") % force
+        try:
+            force = strutils.bool_from_string(force, strict=True)
+        except ValueError:
+            msg = _("Invalid value '%s' for force.") % force
             raise exception.InvalidParameterValue(err=msg)
 
-        if utils.bool_from_str(force):
-            new_snapshot = self.volume_api.create_snapshot_force(context,
-                                        volume,
-                                        snapshot.get('display_name'),
-                                        snapshot.get('display_description'))
+        if force:
+            create_func = self.volume_api.create_snapshot_force
         else:
-            new_snapshot = self.volume_api.create_snapshot(context,
-                                        volume,
-                                        snapshot.get('display_name'),
-                                        snapshot.get('display_description'))
+            create_func = self.volume_api.create_snapshot
+
+        new_snapshot = create_func(context, volume_id,
+                                   snapshot.get('display_name'),
+                                   snapshot.get('display_description'))
 
         retval = _translate_snapshot_detail_view(context, new_snapshot)
-
         return {'snapshot': retval}
 
 
 class Volumes(extensions.ExtensionDescriptor):
-    """Volumes support"""
+    """Volumes support."""
 
     name = "Volumes"
     alias = "os-volumes"

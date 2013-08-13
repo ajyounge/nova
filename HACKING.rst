@@ -9,6 +9,7 @@ Nova Style Commandments
 General
 -------
 - Put two newlines between top-level code (funcs, classes, etc)
+- Use only UNIX style newlines ("\n"), not Windows style ("\r\n")
 - Put one newline between methods in classes and anywhere else
 - Long lines should be wrapped in parentheses
   in preference to using a backslash for line continuation.
@@ -27,12 +28,33 @@ General
 
     mylist = Foo().list() # OKAY, does not shadow built-in
 
+- Use the "is not" operator when testing for unequal identities. Example::
+
+    if not X is Y:  # BAD, intended behavior is ambiguous
+        pass
+
+    if X is not Y:  # OKAY, intuitive
+        pass
+
+- Use the "not in" operator for evaluating membership in a collection. Example::
+
+    if not X in Y:  # BAD, intended behavior is ambiguous
+        pass
+
+    if X not in Y:  # OKAY, intuitive
+        pass
+
+    if not (X in Y or X in Z):  # OKAY, still better than all those 'not's
+        pass
+
 
 Imports
 -------
 - Do not import objects, only modules (*)
 - Do not import more than one module per line (*)
+- Do not use wildcard ``*`` import (*)
 - Do not make relative imports
+- Do not make new nova.db imports in nova/virt/*
 - Order your imports by the full module path
 - Organize your imports according to the following template
 
@@ -41,6 +63,7 @@ Imports
 - imports from ``migrate`` package
 - imports from ``sqlalchemy`` package
 - imports from ``nova.db.sqlalchemy.session`` module
+- imports from ``nova.db.sqlalchemy.migration.versioning_api`` package
 
 Example::
 
@@ -188,6 +211,25 @@ Example::
     LOG.error(msg % {"s_id": "1234", "m_key": "imageId"})
 
 
+Python 3.x compatibility
+------------------------
+Nova code should stay Python 3.x compatible. That means all Python 2.x-only
+constructs should be avoided. An example is
+
+    except x,y:
+
+Use
+
+    except x as y:
+
+instead. Other Python 3.x compatility issues, like e.g. print operator
+can be avoided in new code by using
+
+    from __future__ import print_function
+
+at the top of your module.
+
+
 Creating Unit Tests
 -------------------
 For every new feature, unit tests should be created that both test and
@@ -197,27 +239,68 @@ submitted bug fix does have a unit test, be sure to add a new one that fails
 without the patch and passes with the patch.
 
 For more information on creating unit tests and utilizing the testing
-infrastructure in OpenStack Nova, please read nova/testing/README.rst.
+infrastructure in OpenStack Nova, please read nova/tests/README.rst.
 
 
-openstack-common
+Running Tests
+-------------
+The testing system is based on a combination of tox and testr. The canonical
+approach to running tests is to simply run the command `tox`. This will
+create virtual environments, populate them with depenedencies and run all of
+the tests that OpenStack CI systems run. Behind the scenes, tox is running
+`testr run --parallel`, but is set up such that you can supply any additional
+testr arguments that are needed to tox. For example, you can run:
+`tox -- --analyze-isolation` to cause tox to tell testr to add
+--analyze-isolation to its argument list.
+
+It is also possible to run the tests inside of a virtual environment
+you have created, or it is possible that you have all of the dependencies
+installed locally already. In this case, you can interact with the testr
+command directly. Running `testr run` will run the entire test suite. `testr
+run --parallel` will run it in parallel (this is the default incantation tox
+uses.) More information about testr can be found at:
+http://wiki.openstack.org/testr
+
+Building Docs
+-------------
+Normal Sphinx docs can be built via the setuptools `build_sphinx` command. To
+do this via `tox`, simply run `tox -evenv -- python setup.py build_sphinx`,
+which will cause a virtualenv with all of the needed dependencies to be
+created and then inside of the virtualenv, the docs will be created and
+put into doc/build/html.
+
+If you'd like a PDF of the documentation, you'll need LaTeX installed, and
+additionally some fonts. On Ubuntu systems, you can get what you need with::
+
+    apt-get install texlive-latex-recommended texlive-latex-extra texlive-fonts-recommended
+
+Then run `build_sphinx_latex`, change to the build dir and run `make`.
+Like so::
+
+    tox -evenv -- python setup.py build_sphinx_latex
+    cd build/sphinx/latex
+    make
+
+You should wind up with a PDF - Nova.pdf.
+
+oslo-incubator
 ----------------
 
-A number of modules from openstack-common are imported into the project.
+A number of modules from oslo-incubator are imported into the project.
 
-These modules are "incubating" in openstack-common and are kept in sync
-with the help of openstack-common's update.py script. See:
+These modules are "incubating" in oslo-incubator and are kept in sync
+with the help of oslo's update.py script. See:
 
-  http://wiki.openstack.org/CommonLibrary#Incubation
+  https://wiki.openstack.org/wiki/Oslo#Incubation
 
 The copy of the code should never be directly modified here. Please
-always update openstack-common first and then run the script to copy
+always update oslo-incubator first and then run the script to copy
 the changes across.
 
 OpenStack Trademark
 -------------------
 
-OpenStack is a registered trademark of OpenStack, LLC, and uses the
+OpenStack is a registered trademark of the OpenStack Foundation, and uses the
 following capitalization:
 
    OpenStack
@@ -228,8 +311,8 @@ Commit Messages
 Using a common format for commit messages will help keep our git history
 readable. Follow these guidelines:
 
-  First, provide a brief summary (it is recommended to keep the commit title
-  under 50 chars).
+  First, provide a brief summary of 50 characters or less.  Summaries
+  of greater then 72 characters will be rejected by the gate.
 
   The first line of the commit message should provide an accurate
   description of the change, not just a reference to a bug or

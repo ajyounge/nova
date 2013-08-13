@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2011 OpenStack LLC.
+# Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -20,15 +20,12 @@ import re
 import urllib2
 
 from nova.api.openstack import wsgi
-from nova.openstack.common import log as logging
 
 
 _quoted_string_re = r'"[^"\\]*(?:\\.[^"\\]*)*"'
 _option_header_piece_re = re.compile(r';\s*([^\s;=]+|%s)\s*'
                                      r'(?:=\s*([^;]+|%s))?\s*' %
     (_quoted_string_re, _quoted_string_re))
-
-LOG = logging.getLogger(__name__)
 
 
 def unquote_header_value(value):

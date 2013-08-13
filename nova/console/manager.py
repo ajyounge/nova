@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010 OpenStack, LLC.
+# Copyright (c) 2010 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,11 +19,11 @@
 
 import socket
 
+from oslo.config import cfg
+
 from nova.compute import rpcapi as compute_rpcapi
 from nova import exception
-from nova import flags
 from nova import manager
-from nova.openstack.common import cfg
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova import utils
@@ -37,12 +37,12 @@ console_manager_opts = [
                 default=False,
                 help='Stub calls to compute worker for tests'),
     cfg.StrOpt('console_public_hostname',
-               default=socket.getfqdn(),
+               default=socket.gethostname(),
                help='Publicly visible name for this console host'),
     ]
 
-FLAGS = flags.FLAGS
-FLAGS.register_opts(console_manager_opts)
+CONF = cfg.CONF
+CONF.register_opts(console_manager_opts)
 LOG = logging.getLogger(__name__)
 
 
@@ -53,20 +53,20 @@ class ConsoleProxyManager(manager.Manager):
 
     """
 
-    RPC_API_VERSION = '1.0'
+    RPC_API_VERSION = '1.1'
 
     def __init__(self, console_driver=None, *args, **kwargs):
         if not console_driver:
-            console_driver = FLAGS.console_driver
+            console_driver = CONF.console_driver
         self.driver = importutils.import_object(console_driver)
-        super(ConsoleProxyManager, self).__init__(*args, **kwargs)
+        super(ConsoleProxyManager, self).__init__(service_name='console',
+                                                  *args, **kwargs)
         self.driver.host = self.host
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
 
     def init_host(self):
         self.driver.init_host()
 
-    @exception.wrap_exception()
     def add_console(self, context, instance_id, password=None,
                     port=None, **kwargs):
         instance = self.db.instance_get(context, instance_id)
@@ -94,7 +94,6 @@ class ConsoleProxyManager(manager.Manager):
 
         return console['id']
 
-    @exception.wrap_exception()
     def remove_console(self, context, console_id, **_kwargs):
         try:
             console = self.db.console_get(context, console_id)
@@ -118,7 +117,7 @@ class ConsoleProxyManager(manager.Manager):
             #NOTE(mdragon): Right now, the only place this info exists is the
             #               compute worker's flagfile, at least for
             #               xenserver. Thus we ned to ask.
-            if FLAGS.stub_compute:
+            if CONF.stub_compute:
                 pool_info = {'address': '127.0.0.1',
                              'username': 'test',
                              'password': '1234pass'}
@@ -128,8 +127,13 @@ class ConsoleProxyManager(manager.Manager):
             pool_info['password'] = self.driver.fix_pool_password(
                                                     pool_info['password'])
             pool_info['host'] = self.host
-            pool_info['public_hostname'] = FLAGS.console_public_hostname
+            pool_info['public_hostname'] = CONF.console_public_hostname
             pool_info['console_type'] = self.driver.console_type
             pool_info['compute_host'] = instance_host
             pool = self.db.console_pool_create(context, pool_info)
         return pool
+
+    # NOTE(russellb) This method can be removed in 2.0 of this API.  It is
+    # deprecated in favor of the method in the base API.
+    def get_backdoor_port(self, context):
+        return self.backdoor_port

@@ -1,4 +1,4 @@
-# Copyright (c) 2011 OpenStack, LLC.
+# Copyright (c) 2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,35 +19,44 @@ You can customize this scheduler by specifying your own Host Filters and
 Weighing Functions.
 """
 
-import operator
+import random
 
+from oslo.config import cfg
+
+from nova.compute import flavors
+from nova.compute import rpcapi as compute_rpcapi
+from nova import db
 from nova import exception
-from nova import flags
-from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common.notifier import api as notifier
 from nova.scheduler import driver
-from nova.scheduler import least_cost
 from nova.scheduler import scheduler_options
 
-
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
+
+
+filter_scheduler_opts = [
+    cfg.IntOpt('scheduler_host_subset_size',
+               default=1,
+               help='New instances will be scheduled on a host chosen '
+                    'randomly from a subset of the N best hosts. This '
+                    'property defines the subset size that a host is '
+                    'chosen from. A value of 1 chooses the '
+                    'first host returned by the weighing functions. '
+                    'This value must be at least 1. Any value less than 1 '
+                    'will be ignored, and 1 will be used instead')
+]
+
+CONF.register_opts(filter_scheduler_opts)
 
 
 class FilterScheduler(driver.Scheduler):
     """Scheduler that can be used for filtering and weighing."""
     def __init__(self, *args, **kwargs):
         super(FilterScheduler, self).__init__(*args, **kwargs)
-        self.cost_function_cache = {}
         self.options = scheduler_options.SchedulerOptions()
-
-    def schedule_create_volume(self, context, volume_id, snapshot_id, image_id,
-                               reservations):
-        # NOTE: We're only focused on compute instances right now,
-        # so this method will always raise NoValidHost().
-        msg = _("No host selection for %s defined.") % FLAGS.volume_topic
-        raise exception.NoValidHost(reason=msg)
+        self.compute_rpcapi = compute_rpcapi.ComputeAPI()
 
     def schedule_run_instance(self, context, request_spec,
                               admin_password, injected_files,
@@ -59,18 +68,24 @@ class FilterScheduler(driver.Scheduler):
 
         Returns a list of the instances created.
         """
-        elevated = context.elevated()
-        instance_uuids = request_spec.get('instance_uuids')
-        num_instances = len(instance_uuids)
-        LOG.debug(_("Attempting to build %(num_instances)d instance(s)") %
-                locals())
-
         payload = dict(request_spec=request_spec)
         notifier.notify(context, notifier.publisher_id("scheduler"),
                         'scheduler.run_instance.start', notifier.INFO, payload)
 
-        weighted_hosts = self._schedule(context, "compute", request_spec,
-                                        filter_properties, instance_uuids)
+        instance_uuids = request_spec.get('instance_uuids')
+        LOG.info(_("Attempting to build %(num_instances)d instance(s) "
+                    "uuids: %(instance_uuids)s"),
+                  {'num_instances': len(instance_uuids),
+                   'instance_uuids': instance_uuids})
+        LOG.debug(_("Request Spec: %s") % request_spec)
+
+        weighed_hosts = self._schedule(context, request_spec,
+                                       filter_properties, instance_uuids)
+
+        # NOTE: Pop instance_uuids as individual creates do not need the
+        # set of uuids. Do not pop before here as the upper exception
+        # handler fo NoValidHost needs the uuid to set error state
+        instance_uuids = request_spec.pop('instance_uuids')
 
         # NOTE(comstud): Make sure we do not pass this through.  It
         # contains an instance of RpcContext that cannot be serialized.
@@ -81,11 +96,15 @@ class FilterScheduler(driver.Scheduler):
 
             try:
                 try:
-                    weighted_host = weighted_hosts.pop(0)
+                    weighed_host = weighed_hosts.pop(0)
+                    LOG.info(_("Choosing host %(weighed_host)s "
+                                "for instance %(instance_uuid)s"),
+                              {'weighed_host': weighed_host,
+                               'instance_uuid': instance_uuid})
                 except IndexError:
                     raise exception.NoValidHost(reason="")
 
-                self._provision_resource(elevated, weighted_host,
+                self._provision_resource(context, weighed_host,
                                          request_spec,
                                          filter_properties,
                                          requested_networks,
@@ -115,53 +134,90 @@ class FilterScheduler(driver.Scheduler):
         the prep_resize operation to it.
         """
 
-        hosts = self._schedule(context, 'compute', request_spec,
-                               filter_properties, [instance['uuid']])
-        if not hosts:
+        weighed_hosts = self._schedule(context, request_spec,
+                filter_properties, [instance['uuid']])
+        if not weighed_hosts:
             raise exception.NoValidHost(reason="")
-        host = hosts.pop(0)
+        weighed_host = weighed_hosts.pop(0)
+
+        self._post_select_populate_filter_properties(filter_properties,
+                weighed_host.obj)
+
+        # context is not serializable
+        filter_properties.pop('context', None)
 
         # Forward off to the host
         self.compute_rpcapi.prep_resize(context, image, instance,
-                instance_type, host.host_state.host, reservations)
+                instance_type, weighed_host.obj.host, reservations,
+                request_spec=request_spec, filter_properties=filter_properties,
+                node=weighed_host.obj.nodename)
 
-    def _provision_resource(self, context, weighted_host, request_spec,
+    def select_hosts(self, context, request_spec, filter_properties):
+        """Selects a filtered set of hosts."""
+        instance_uuids = request_spec.get('instance_uuids')
+        hosts = [host.obj.host for host in self._schedule(context,
+            request_spec, filter_properties, instance_uuids)]
+        if not hosts:
+            raise exception.NoValidHost(reason="")
+        return hosts
+
+    def _provision_resource(self, context, weighed_host, request_spec,
             filter_properties, requested_networks, injected_files,
             admin_password, is_first_time, instance_uuid=None):
         """Create the requested resource in this Zone."""
-        # Add a retry entry for the selected compute host:
-        self._add_retry_host(filter_properties, weighted_host.host_state.host)
-
-        self._add_oversubscription_policy(filter_properties,
-                weighted_host.host_state)
-
+        # NOTE(vish): add our current instance back into the request spec
+        request_spec['instance_uuids'] = [instance_uuid]
         payload = dict(request_spec=request_spec,
-                       weighted_host=weighted_host.to_dict(),
+                       weighted_host=weighed_host.to_dict(),
                        instance_id=instance_uuid)
         notifier.notify(context, notifier.publisher_id("scheduler"),
                         'scheduler.run_instance.scheduled', notifier.INFO,
                         payload)
 
+        # Update the metadata if necessary
+        scheduler_hints = filter_properties.get('scheduler_hints') or {}
+        group = scheduler_hints.get('group', None)
+        values = None
+        if group:
+            values = request_spec['instance_properties']['system_metadata']
+            values.update({'group': group})
+            values = {'system_metadata': values}
+
         updated_instance = driver.instance_update_db(context,
-                instance_uuid, weighted_host.host_state.host)
+                instance_uuid, extra_values=values)
+
+        self._post_select_populate_filter_properties(filter_properties,
+                weighed_host.obj)
 
         self.compute_rpcapi.run_instance(context, instance=updated_instance,
-                host=weighted_host.host_state.host,
+                host=weighed_host.obj.host,
                 request_spec=request_spec, filter_properties=filter_properties,
                 requested_networks=requested_networks,
                 injected_files=injected_files,
-                admin_password=admin_password, is_first_time=is_first_time)
+                admin_password=admin_password, is_first_time=is_first_time,
+                node=weighed_host.obj.nodename)
 
-    def _add_retry_host(self, filter_properties, host):
-        """Add a retry entry for the selected compute host.  In the event that
+    def _post_select_populate_filter_properties(self, filter_properties,
+            host_state):
+        """Add additional information to the filter properties after a node has
+        been selected by the scheduling process.
+        """
+        # Add a retry entry for the selected compute host and node:
+        self._add_retry_host(filter_properties, host_state.host,
+                             host_state.nodename)
+
+        self._add_oversubscription_policy(filter_properties, host_state)
+
+    def _add_retry_host(self, filter_properties, host, node):
+        """Add a retry entry for the selected compute node. In the event that
         the request gets re-scheduled, this entry will signal that the given
-        host has already been tried.
+        node has already been tried.
         """
         retry = filter_properties.get('retry', None)
         if not retry:
             return
         hosts = retry['hosts']
-        hosts.append(host)
+        hosts.append([host, node])
 
     def _add_oversubscription_policy(self, filter_properties, host_state):
         filter_properties['limits'] = host_state.limits
@@ -181,11 +237,31 @@ class FilterScheduler(driver.Scheduler):
         filter_properties['os_type'] = os_type
 
     def _max_attempts(self):
-        max_attempts = FLAGS.scheduler_max_attempts
+        max_attempts = CONF.scheduler_max_attempts
         if max_attempts < 1:
             raise exception.NovaException(_("Invalid value for "
                 "'scheduler_max_attempts', must be >= 1"))
         return max_attempts
+
+    def _log_compute_error(self, instance_uuid, retry):
+        """If the request contained an exception from a previous compute
+        build/resize operation, log it to aid debugging
+        """
+        exc = retry.pop('exc', None)  # string-ified exception from compute
+        if not exc:
+            return  # no exception info from a prevous attempt, skip
+
+        hosts = retry.get('hosts', None)
+        if not hosts:
+            return  # no previously attempted hosts, skip
+
+        last_host, last_node = hosts[-1]
+        LOG.error(_('Error from last host: %(last_host)s (node %(last_node)s):'
+                    ' %(exc)s'),
+                  {'last_host': last_host,
+                   'last_node': last_node,
+                   'exc': exc},
+                  instance_uuid=instance_uuid)
 
     def _populate_retry(self, filter_properties, instance_properties):
         """Populate filter properties with history of retries for this
@@ -208,26 +284,38 @@ class FilterScheduler(driver.Scheduler):
             }
         filter_properties['retry'] = retry
 
+        instance_uuid = instance_properties.get('uuid')
+        self._log_compute_error(instance_uuid, retry)
+
         if retry['num_attempts'] > max_attempts:
-            instance_uuid = instance_properties.get('uuid')
-            msg = _("Exceeded max scheduling attempts %(max_attempts)d for "
-                    "instance %(instance_uuid)s") % locals()
+            msg = (_('Exceeded max scheduling attempts %(max_attempts)d for '
+                     'instance %(instance_uuid)s')
+                   % {'max_attempts': max_attempts,
+                      'instance_uuid': instance_uuid})
             raise exception.NoValidHost(reason=msg)
 
-    def _schedule(self, context, topic, request_spec, filter_properties,
+    def _schedule(self, context, request_spec, filter_properties,
                   instance_uuids=None):
         """Returns a list of hosts that meet the required specs,
         ordered by their fitness.
         """
         elevated = context.elevated()
-        if topic != "compute":
-            msg = _("Scheduler only understands Compute nodes (for now)")
-            raise NotImplementedError(msg)
-
-        instance_properties = request_spec['instance_properties']
         instance_type = request_spec.get("instance_type", None)
+        instance_properties = request_spec['instance_properties']
+        instance_properties.setdefault('instance_type', instance_type)
 
-        cost_functions = self.get_cost_functions()
+        # Get the group
+        update_group_hosts = False
+        scheduler_hints = filter_properties.get('scheduler_hints') or {}
+        group = scheduler_hints.get('group', None)
+        if group:
+            group_hosts = self.group_hosts(elevated, group)
+            update_group_hosts = True
+            if 'group_hosts' not in filter_properties:
+                filter_properties.update({'group_hosts': []})
+            configured_hosts = filter_properties['group_hosts']
+            filter_properties['group_hosts'] = configured_hosts + group_hosts
+
         config_options = self._get_configuration_options()
 
         # check retry policy.  Rather ugly use of instance_uuids[0]...
@@ -251,14 +339,10 @@ class FilterScheduler(driver.Scheduler):
         # host, we virtually consume resources on it so subsequent
         # selections can adjust accordingly.
 
-        # unfiltered_hosts_dict is {host : ZoneManager.HostInfo()}
-        unfiltered_hosts_dict = self.host_manager.get_all_host_states(
-                elevated, topic)
-
         # Note: remember, we are using an iterator here. So only
         # traverse this list once. This can bite you if the hosts
         # are being scanned in a filter or weighing function.
-        hosts = unfiltered_hosts_dict.itervalues()
+        hosts = self.host_manager.get_all_host_states(elevated)
 
         selected_hosts = []
         if instance_uuids:
@@ -267,105 +351,72 @@ class FilterScheduler(driver.Scheduler):
             num_instances = request_spec.get('num_instances', 1)
         for num in xrange(num_instances):
             # Filter local hosts based on requirements ...
-            hosts = self.host_manager.filter_hosts(hosts,
+            hosts = self.host_manager.get_filtered_hosts(hosts,
                     filter_properties)
             if not hosts:
                 # Can't get any more locally.
                 break
 
-            LOG.debug(_("Filtered %(hosts)s") % locals())
+            LOG.debug(_("Filtered %(hosts)s"), {'hosts': hosts})
 
-            # weighted_host = WeightedHost() ... the best
-            # host for the job.
-            # TODO(comstud): filter_properties will also be used for
-            # weighing and I plan fold weighing into the host manager
-            # in a future patch.  I'll address the naming of this
-            # variable at that time.
-            weighted_host = least_cost.weighted_sum(cost_functions,
-                    hosts, filter_properties)
-            LOG.debug(_("Weighted %(weighted_host)s") % locals())
-            selected_hosts.append(weighted_host)
+            weighed_hosts = self.host_manager.get_weighed_hosts(hosts,
+                    filter_properties)
+
+            LOG.debug(_("Weighed %(hosts)s"), {'hosts': weighed_hosts})
+
+            scheduler_host_subset_size = CONF.scheduler_host_subset_size
+            if scheduler_host_subset_size > len(weighed_hosts):
+                scheduler_host_subset_size = len(weighed_hosts)
+            if scheduler_host_subset_size < 1:
+                scheduler_host_subset_size = 1
+
+            chosen_host = random.choice(
+                weighed_hosts[0:scheduler_host_subset_size])
+            selected_hosts.append(chosen_host)
 
             # Now consume the resources so the filter/weights
             # will change for the next instance.
-            weighted_host.host_state.consume_from_instance(
-                    instance_properties)
-
-        selected_hosts.sort(key=operator.attrgetter('weight'))
+            chosen_host.obj.consume_from_instance(instance_properties)
+            if update_group_hosts is True:
+                filter_properties['group_hosts'].append(chosen_host.obj.host)
         return selected_hosts
 
-    def get_cost_functions(self, topic=None):
-        """Returns a list of tuples containing weights and cost functions to
-        use for weighing hosts
+    def _get_compute_info(self, context, dest):
+        """Get compute node's information
+
+        :param context: security context
+        :param dest: hostname (must be compute node)
+        :return: dict of compute node information
+
         """
-        if topic is None:
-            # Schedulers only support compute right now.
-            topic = "compute"
-        if topic in self.cost_function_cache:
-            return self.cost_function_cache[topic]
+        service_ref = db.service_get_by_compute_host(context, dest)
+        return service_ref['compute_node'][0]
 
-        cost_fns = []
-        for cost_fn_str in FLAGS.least_cost_functions:
-            if '.' in cost_fn_str:
-                short_name = cost_fn_str.split('.')[-1]
-            else:
-                short_name = cost_fn_str
-                cost_fn_str = "%s.%s.%s" % (
-                        __name__, self.__class__.__name__, short_name)
-            if not (short_name.startswith('%s_' % topic) or
-                    short_name.startswith('noop')):
-                continue
+    def _assert_compute_node_has_enough_memory(self, context,
+                                              instance_ref, dest):
+        """Checks if destination host has enough memory for live migration.
 
-            try:
-                # NOTE: import_class is somewhat misnamed since
-                # the weighing function can be any non-class callable
-                # (i.e., no 'self')
-                cost_fn = importutils.import_class(cost_fn_str)
-            except ImportError:
-                raise exception.SchedulerCostFunctionNotFound(
-                        cost_fn_str=cost_fn_str)
 
-            try:
-                flag_name = "%s_weight" % cost_fn.__name__
-                weight = getattr(FLAGS, flag_name)
-            except AttributeError:
-                raise exception.SchedulerWeightFlagNotFound(
-                        flag_name=flag_name)
-            cost_fns.append((weight, cost_fn))
+        :param context: security context
+        :param instance_ref: nova.db.sqlalchemy.models.Instance object
+        :param dest: destination host
 
-        self.cost_function_cache[topic] = cost_fns
-        return cost_fns
+        """
+        compute = self._get_compute_info(context, dest)
+        node = compute.get('hypervisor_hostname')
+        host_state = self.host_manager.host_state_cls(dest, node)
+        host_state.update_from_compute_node(compute)
 
-# from this below, dkang added
-    def schedule_create_volume(self, context, volume_id, *_args, **_kwargs):
-        """Picks a host that is up and has the fewest volumes."""
-        elevated = context.elevated()
+        instance_type = flavors.extract_flavor(instance_ref)
+        filter_properties = {'instance_type': instance_type}
 
-        volume_ref = db.volume_get(context, volume_id)
-        availability_zone = volume_ref.get('availability_zone')
-
-        zone, host = None, None
-        if availability_zone:
-            zone, _x, host = availability_zone.partition(':')
-        if host and context.is_admin:
-            service = db.service_get_by_args(elevated, host, 'nova-volume')
-            if not utils.service_is_up(service):
-                raise exception.WillNotSchedule(host=host)
-            driver.cast_to_volume_host(context, host, 'create_volume',
-                    volume_id=volume_id, **_kwargs)
-            return None
-
-        results = db.service_get_all_volume_sorted(elevated)
-        if zone:
-            results = [(service, gigs) for (service, gigs) in results
-                       if service['availability_zone'] == zone]
-        for result in results:
-            (service, volume_gigabytes) = result
-            if volume_gigabytes + volume_ref['size'] > FLAGS.max_gigabytes:
-                msg = _("Not enough allocatable volume gigabytes remaining")
-                raise exception.NoValidHost(reason=msg)
-            if utils.service_is_up(service) and not service['disabled']:
-                driver.cast_to_volume_host(context, service['host'],
-                        'create_volume', volume_id=volume_id, **_kwargs)
-                return None
-        msg = _("Is the appropriate service running?")
+        hosts = self.host_manager.get_filtered_hosts([host_state],
+                                                     filter_properties,
+                                                     'RamFilter')
+        if not hosts:
+            instance_uuid = instance_ref['uuid']
+            reason = (_("Unable to migrate %(instance_uuid)s to %(dest)s: "
+                        "Lack of memory")
+                      % {'instance_uuid': instance_uuid,
+                         'dest': dest})
+            raise exception.MigrationPreCheckError(reason=reason)

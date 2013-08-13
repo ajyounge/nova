@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2011 OpenStack, LLC.
+# Copyright (c) 2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -26,8 +26,9 @@ import datetime
 import json
 import os
 
-from nova import flags
-from nova.openstack.common import cfg
+from oslo.config import cfg
+
+from nova.openstack.common import excutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
 
@@ -37,8 +38,8 @@ scheduler_json_config_location_opt = cfg.StrOpt(
         default='',
         help='Absolute path to scheduler configuration JSON file.')
 
-FLAGS = flags.FLAGS
-FLAGS.register_opt(scheduler_json_config_location_opt)
+CONF = cfg.CONF
+CONF.register_opt(scheduler_json_config_location_opt)
 
 LOG = logging.getLogger(__name__)
 
@@ -65,18 +66,18 @@ class SchedulerOptions(object):
         """Get the last modified datetime. Broken out for testing."""
         try:
             return os.path.getmtime(filename)
-        except os.error, e:
-            LOG.exception(_("Could not stat scheduler options file "
-                            "%(filename)s: '%(e)s'"), locals())
-            raise
+        except os.error as e:
+            with excutils.save_and_reraise_exception():
+                LOG.exception(_("Could not stat scheduler options file "
+                                "%(filename)s: '%(e)s'"),
+                              {'filename': filename, 'e': e})
 
     def _load_file(self, handle):
         """Decode the JSON file. Broken out for testing."""
         try:
             return json.load(handle)
-        except ValueError, e:
-            LOG.exception(_("Could not decode scheduler options: "
-                            "'%(e)s'") % locals())
+        except ValueError as e:
+            LOG.exception(_("Could not decode scheduler options: '%s'"), e)
             return {}
 
     def _get_time_now(self):
@@ -86,7 +87,7 @@ class SchedulerOptions(object):
     def get_configuration(self, filename=None):
         """Check the json file for changes and load it if needed."""
         if not filename:
-            filename = FLAGS.scheduler_json_config_location
+            filename = CONF.scheduler_json_config_location
         if not filename:
             return self.data
         if self.last_checked:

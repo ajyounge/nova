@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 #
-# Copyright 2011 OpenStack LLC.
+# Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,7 +19,6 @@ import datetime
 
 from nova.api.openstack import compute
 import nova.db.api
-from nova import flags
 from nova.openstack.common import jsonutils
 import nova.openstack.common.rpc
 from nova import test
@@ -31,8 +30,6 @@ MANUAL_INSTANCE_UUID = fakes.FAKE_UUID
 AUTO_INSTANCE_UUID = fakes.FAKE_UUID.replace('a', 'b')
 
 stub_instance = fakes.stub_instance
-FLAGS = flags.FLAGS
-
 
 API_DISK_CONFIG = 'OS-DCF:diskConfig'
 
@@ -45,7 +42,10 @@ class DiskConfigTestCase(test.TestCase):
 
     def setUp(self):
         super(DiskConfigTestCase, self).setUp()
-        self.flags(verbose=True)
+        self.flags(verbose=True,
+            osapi_compute_extension=[
+                'nova.api.openstack.compute.contrib.select_extensions'],
+            osapi_compute_ext_list=['Disk_config'])
         nova.tests.image.fake.stub_out_image_service(self.stubs)
 
         fakes.stub_out_nw_api(self.stubs)
@@ -125,7 +125,7 @@ class DiskConfigTestCase(test.TestCase):
 
         self.stubs.Set(nova.db, 'instance_create', fake_instance_create)
 
-        self.app = compute.APIRouter()
+        self.app = compute.APIRouter(init_only=('servers', 'images'))
 
     def tearDown(self):
         super(DiskConfigTestCase, self).tearDown()
@@ -247,7 +247,7 @@ class DiskConfigTestCase(test.TestCase):
         self.assertDiskConfig(server_dict, 'AUTO')
 
     def test_update_server_invalid_disk_config(self):
-        """Return BadRequest if user passes an invalid diskConfig value."""
+        # Return BadRequest if user passes an invalid diskConfig value.
         req = fakes.HTTPRequest.blank(
             '/fake/servers/%s' % MANUAL_INSTANCE_UUID)
         req.method = 'PUT'

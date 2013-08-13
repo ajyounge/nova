@@ -1,4 +1,4 @@
-# Copyright (c) 2012 OpenStack, LLC
+# Copyright (c) 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -15,6 +15,7 @@
 """Various utilities used by XenServer plugins."""
 
 import cPickle as pickle
+import errno
 import logging
 import os
 import shlex
@@ -24,32 +25,51 @@ import tempfile
 
 import XenAPIPlugin
 
+LOG = logging.getLogger(__name__)
 CHUNK_SIZE = 8192
 
 
+def delete_if_exists(path):
+    try:
+        os.unlink(path)
+    except OSError, e:
+        if e.errno == errno.ENOENT:
+            LOG.warning("'%s' was already deleted, skipping delete" % path)
+        else:
+            raise
+
+
 def _link(src, dst):
-    logging.info("Hard-linking file '%s' -> '%s'" % (src, dst))
+    LOG.info("Hard-linking file '%s' -> '%s'" % (src, dst))
     os.link(src, dst)
 
 
 def _rename(src, dst):
-    logging.info("Renaming file '%s' -> '%s'" % (src, dst))
-    os.rename(src, dst)
+    LOG.info("Renaming file '%s' -> '%s'" % (src, dst))
+    try:
+        os.rename(src, dst)
+    except OSError, e:
+        if e.errno == errno.EXDEV:
+            LOG.error("Invalid cross-device link.  Perhaps %s and %s should "
+                      "be symlinked on the same filesystem?" % (src, dst))
+        raise
 
 
-def make_subprocess(cmdline, stdout=False, stderr=False, stdin=False):
+def make_subprocess(cmdline, stdout=False, stderr=False, stdin=False,
+                    universal_newlines=False):
     """Make a subprocess according to the given command-line string
     """
     # NOTE(dprince): shlex python 2.4 doesn't like unicode so we
     # explicitly convert to ascii
     cmdline = cmdline.encode('ascii')
-    logging.info("Running cmd '%s'" % cmdline)
+    LOG.info("Running cmd '%s'" % cmdline)
     kwargs = {}
     kwargs['stdout'] = stdout and subprocess.PIPE or None
     kwargs['stderr'] = stderr and subprocess.PIPE or None
     kwargs['stdin'] = stdin and subprocess.PIPE or None
+    kwargs['universal_newlines'] = universal_newlines
     args = shlex.split(cmdline)
-    logging.info("Running args '%s'" % args)
+    LOG.info("Running args '%s'" % args)
     proc = subprocess.Popen(args, **kwargs)
     return proc
 
@@ -150,7 +170,7 @@ def _assert_vhd_not_hidden(path):
     out, err = finish_subprocess(query_proc, query_cmd)
 
     for line in out.splitlines():
-        if line.startswith('hidden'):
+        if line.lower().startswith('hidden'):
             value = line.split(':')[1].strip()
             if value == "1":
                 raise Exception(
@@ -158,8 +178,13 @@ def _assert_vhd_not_hidden(path):
                     locals())
 
 
-def _validate_footer_timestamp(vdi_path):
+def _validate_vhd(vdi_path):
     """
+    This checks for several errors in the VHD structure.
+
+    Most notably, it checks that the timestamp in the footer is correct, but
+    may pick up other errors also.
+
     This check ensures that the timestamps listed in the VHD footer aren't in
     the future.  This can occur during a migration if the clocks on the the two
     Dom0's are out-of-sync. This would corrupt the SR if it were imported, so
@@ -171,13 +196,30 @@ def _validate_footer_timestamp(vdi_path):
             check_proc, check_cmd, ok_exit_codes=[0, 22])
     first_line = out.splitlines()[0].strip()
 
-    if 'primary footer invalid' in first_line:
-        raise Exception("VDI '%(vdi_path)s' has timestamp in the future,"
-                        " ensure source and destination host machines have"
-                        " time set correctly" % locals())
-    elif check_proc.returncode != 0:
-        raise Exception("Unexpected output '%(out)s' from vhd-util" %
-                        locals())
+    if 'invalid' in first_line:
+        if 'footer' in first_line:
+            part = 'footer'
+        elif 'header' in first_line:
+            part = 'header'
+        else:
+            part = 'setting'
+
+        details = first_line.split(':', 1)
+        if len(details) == 2:
+            details = details[1]
+        else:
+            details = first_line
+
+        extra = ''
+        if 'timestamp' in first_line:
+            extra = (" ensure source and destination host machines have "
+                     "time set correctly")
+
+        LOG.info("VDI Error details: %s" % out)
+
+        raise Exception(
+            "VDI '%(vdi_path)s' has an invalid %(part)s: '%(details)s'"
+            "%(extra)s" % locals())
 
 
 def _validate_vdi_chain(vdi_path):
@@ -207,7 +249,7 @@ def _validate_vdi_chain(vdi_path):
 
     cur_path = vdi_path
     while cur_path:
-        _validate_footer_timestamp(cur_path)
+        _validate_vhd(cur_path)
         cur_path = get_parent_path(cur_path)
 
 
@@ -221,6 +263,7 @@ def _validate_sequenced_vhds(staging_path):
         if not filename.endswith('.vhd'):
             continue
 
+        # Ignore legacy swap embedded in the image, generated on-the-fly now
         if filename == "swap.vhd":
             continue
 
@@ -242,13 +285,11 @@ def import_vhds(sr_path, staging_path, uuid_stack):
 
     Returns: A dict of imported VHDs:
 
-        {'root': {'uuid': 'ffff-aaaa'},
-         'swap': {'uuid': 'ffff-bbbb'}}
+        {'root': {'uuid': 'ffff-aaaa'}}
     """
     _handle_old_style_images(staging_path)
     _validate_sequenced_vhds(staging_path)
 
-    imported_vhds = {}
     files_to_move = []
 
     # Collect sequenced VHDs and assign UUIDs to them
@@ -286,26 +327,12 @@ def import_vhds(sr_path, staging_path, uuid_stack):
     _assert_vhd_not_hidden(leaf_vhd_path)
     _validate_vdi_chain(leaf_vhd_path)
 
-    imported_vhds["root"] = {"uuid": leaf_vhd_uuid}
-
-    # Handle swap file if present
-    orig_swap_path = os.path.join(staging_path, "swap.vhd")
-    if os.path.exists(orig_swap_path):
-        # Rename swap.vhd -> aaaa-bbbb-cccc-dddd.vhd
-        vhd_uuid = uuid_stack.pop()
-        swap_path = os.path.join(staging_path, "%s.vhd" % vhd_uuid)
-        _rename(orig_swap_path, swap_path)
-
-        _assert_vhd_not_hidden(swap_path)
-
-        imported_vhds["swap"] = {"uuid": vhd_uuid}
-        files_to_move.append(swap_path)
-
     # Move files into SR
     for orig_path in files_to_move:
         new_path = os.path.join(sr_path, os.path.basename(orig_path))
         _rename(orig_path, new_path)
 
+    imported_vhds = dict(root=dict(uuid=leaf_vhd_uuid))
     return imported_vhds
 
 

@@ -2,7 +2,7 @@
 
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC.
+# Copyright 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -107,7 +107,7 @@ def _get_db_driver_class(db_type):
     elif db_type == "postgres":
         return Postgres
     else:
-        raise Exception("database %s not supported" % db_type)
+        raise Exception(_("database %s not supported") % db_type)
 
 
 ### Migrate

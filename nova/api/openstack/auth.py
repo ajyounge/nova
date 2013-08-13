@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2010 OpenStack LLC.
+# Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -17,18 +17,16 @@
 
 import os
 
+from oslo.config import cfg
 import webob.dec
 import webob.exc
 
 from nova.api.openstack import wsgi
 from nova import context
-from nova import flags
-from nova.openstack.common import log as logging
 from nova import wsgi as base_wsgi
 
-LOG = logging.getLogger(__name__)
-FLAGS = flags.FLAGS
-flags.DECLARE('use_forwarded_for', 'nova.api.auth')
+CONF = cfg.CONF
+CONF.import_opt('use_forwarded_for', 'nova.api.auth')
 
 
 class NoAuthMiddleware(base_wsgi.Middleware):
@@ -54,7 +52,7 @@ class NoAuthMiddleware(base_wsgi.Middleware):
         user_id, _sep, project_id = token.partition(':')
         project_id = project_id or user_id
         remote_address = getattr(req, 'remote_address', '127.0.0.1')
-        if FLAGS.use_forwarded_for:
+        if CONF.use_forwarded_for:
             remote_address = req.headers.get('X-Forwarded-For', remote_address)
         ctx = context.RequestContext(user_id,
                                      project_id,

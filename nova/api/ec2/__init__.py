@@ -23,6 +23,7 @@ Starting point for routing EC2 requests.
 import urlparse
 
 from eventlet.green import httplib
+from oslo.config import cfg
 import webob
 import webob.dec
 import webob.exc
@@ -33,11 +34,10 @@ from nova.api.ec2 import faults
 from nova.api import validator
 from nova import context
 from nova import exception
-from nova import flags
-from nova.openstack.common import cfg
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
+from nova.openstack.common import memorycache
 from nova.openstack.common import timeutils
 from nova import utils
 from nova import wsgi
@@ -66,17 +66,19 @@ ec2_opts = [
                 default=True,
                 help='Validate security group names'
                      ' according to EC2 specification'),
+    cfg.IntOpt('ec2_timestamp_expiry',
+               default=300,
+               help='Time in seconds before ec2 timestamp expires'),
     ]
 
-FLAGS = flags.FLAGS
-FLAGS.register_opts(ec2_opts)
-
-flags.DECLARE('use_forwarded_for', 'nova.api.auth')
+CONF = cfg.CONF
+CONF.register_opts(ec2_opts)
+CONF.import_opt('use_forwarded_for', 'nova.api.auth')
 
 
 def ec2_error(req, request_id, code, message):
-    """Helper to send an ec2_compatible error"""
-    LOG.error(_('%(code)s: %(message)s') % locals())
+    """Helper to send an ec2_compatible error."""
+    LOG.error(_('%(code)s: %(message)s'), {'code': code, 'message': message})
     resp = webob.Response()
     resp.status = 400
     resp.headers['Content-Type'] = 'text/xml'
@@ -156,16 +158,12 @@ class Lockout(wsgi.Middleware):
 
     There is a possible race condition where simultaneous requests could
     sneak in before the lockout hits, but this is extremely rare and would
-    only result in a couple of extra failed attempts."""
+    only result in a couple of extra failed attempts.
+    """
 
     def __init__(self, application):
         """middleware can use fake for testing."""
-        if FLAGS.memcached_servers:
-            import memcache
-        else:
-            from nova.common import memorycache as memcache
-        self.mc = memcache.Client(FLAGS.memcached_servers,
-                                  debug=0)
+        self.mc = memorycache.get_client()
         super(Lockout, self).__init__(application)
 
     @webob.dec.wsgify(RequestClass=wsgi.Request)
@@ -173,7 +171,7 @@ class Lockout(wsgi.Middleware):
         access_key = str(req.params['AWSAccessKeyId'])
         failures_key = "authfailures-%s" % access_key
         failures = int(self.mc.get(failures_key) or 0)
-        if failures >= FLAGS.lockout_attempts:
+        if failures >= CONF.lockout_attempts:
             detail = _("Too many failed authentications.")
             raise webob.exc.HTTPForbidden(detail=detail)
         res = req.get_response(self.application)
@@ -181,15 +179,16 @@ class Lockout(wsgi.Middleware):
             failures = self.mc.incr(failures_key)
             if failures is None:
                 # NOTE(vish): To use incr, failures has to be a string.
-                self.mc.set(failures_key, '1', time=FLAGS.lockout_window * 60)
-            elif failures >= FLAGS.lockout_attempts:
-                lock_mins = FLAGS.lockout_minutes
-                msg = _('Access key %(access_key)s has had %(failures)d'
-                        ' failed authentications and will be locked out'
-                        ' for %(lock_mins)d minutes.') % locals()
-                LOG.warn(msg)
+                self.mc.set(failures_key, '1', time=CONF.lockout_window * 60)
+            elif failures >= CONF.lockout_attempts:
+                LOG.warn(_('Access key %(access_key)s has had %(failures)d '
+                           'failed authentications and will be locked out '
+                           'for %(lock_mins)d minutes.'),
+                         {'access_key': access_key,
+                          'failures': failures,
+                          'lock_mins': CONF.lockout_minutes})
                 self.mc.set(failures_key, str(failures),
-                            time=FLAGS.lockout_minutes * 60)
+                            time=CONF.lockout_minutes * 60)
         return res
 
 
@@ -221,14 +220,14 @@ class EC2KeystoneAuth(wsgi.Middleware):
             'path': req.path,
             'params': auth_params,
         }
-        if "ec2" in FLAGS.keystone_ec2_url:
+        if "ec2" in CONF.keystone_ec2_url:
             creds = {'ec2Credentials': cred_dict}
         else:
             creds = {'auth': {'OS-KSEC2:ec2Credentials': cred_dict}}
         creds_json = jsonutils.dumps(creds)
         headers = {'Content-Type': 'application/json'}
 
-        o = urlparse.urlparse(FLAGS.keystone_ec2_url)
+        o = urlparse.urlparse(CONF.keystone_ec2_url)
         if o.scheme == "http":
             conn = httplib.HTTPConnection(o.netloc)
         else:
@@ -253,13 +252,13 @@ class EC2KeystoneAuth(wsgi.Middleware):
             project_name = result['access']['token']['tenant'].get('name')
             roles = [role['name'] for role
                      in result['access']['user']['roles']]
-        except (AttributeError, KeyError), e:
-            LOG.exception("Keystone failure: %s" % e)
+        except (AttributeError, KeyError) as e:
+            LOG.exception(_("Keystone failure: %s") % e)
             msg = _("Failure communicating with keystone")
             return ec2_error(req, request_id, "Unauthorized", msg)
 
         remote_address = req.remote_addr
-        if FLAGS.use_forwarded_for:
+        if CONF.use_forwarded_for:
             remote_address = req.headers.get('X-Forwarded-For',
                                              remote_address)
 
@@ -288,7 +287,7 @@ class NoAuth(wsgi.Middleware):
         user_id, _sep, project_id = req.params['AWSAccessKeyId'].partition(':')
         project_id = project_id or user_id
         remote_address = req.remote_addr
-        if FLAGS.use_forwarded_for:
+        if CONF.use_forwarded_for:
             remote_address = req.headers.get('X-Forwarded-For', remote_address)
         ctx = context.RequestContext(user_id,
                                      project_id,
@@ -311,6 +310,13 @@ class Requestify(wsgi.Middleware):
                     'SignatureVersion', 'Version', 'Timestamp']
         args = dict(req.params)
         try:
+            expired = ec2utils.is_ec2_timestamp_expired(req.params,
+                            expires=CONF.ec2_timestamp_expiry)
+            if expired:
+                msg = _("Timestamp failed validation.")
+                LOG.exception(msg)
+                raise webob.exc.HTTPForbidden(detail=msg)
+
             # Raise KeyError if omitted
             action = req.params['Action']
             # Fix bug lp:720157 for older (version 1) clients
@@ -322,12 +328,15 @@ class Requestify(wsgi.Middleware):
             for non_arg in non_args:
                 # Remove, but raise KeyError if omitted
                 args.pop(non_arg)
-        except KeyError, e:
+        except KeyError:
             raise webob.exc.HTTPBadRequest()
+        except exception.InvalidRequest as err:
+            raise webob.exc.HTTPBadRequest(explanation=unicode(err))
 
         LOG.debug(_('action: %s'), action)
         for key, value in args.items():
-            LOG.debug(_('arg: %(key)s\t\tval: %(value)s') % locals())
+            LOG.debug(_('arg: %(key)s\t\tval: %(value)s'),
+                      {'key': key, 'value': value})
 
         # Success!
         api_request = apirequest.APIRequest(self.controller, action,
@@ -403,7 +412,9 @@ class Authorizer(wsgi.Middleware):
             return self.application
         else:
             LOG.audit(_('Unauthorized request for controller=%(controller)s '
-                        'and action=%(action)s') % locals(), context=context)
+                        'and action=%(action)s'),
+                      {'controller': controller, 'action': action},
+                      context=context)
             raise webob.exc.HTTPUnauthorized()
 
     def _matches_any_role(self, context, roles):
@@ -436,7 +447,7 @@ class Validator(wsgi.Middleware):
         'image_id': validator.validate_ec2_id,
         'attribute': validator.validate_str(),
         'image_location': validator.validate_image_path,
-        'public_ip': validator.validate_ipv4,
+        'public_ip': utils.is_valid_ipv4,
         'region_name': validator.validate_str(),
         'group_name': validator.validate_str(max_length=255),
         'group_description': validator.validate_str(max_length=255),
@@ -495,8 +506,6 @@ class Executor(wsgi.Application):
             LOG.info(_('NotFound raised: %s'), unicode(ex), context=context)
             return ec2_error(req, request_id, type(ex).__name__, unicode(ex))
         except exception.EC2APIError as ex:
-            LOG.exception(_('EC2APIError raised: %s'), unicode(ex),
-                          context=context)
             if ex.code:
                 return ec2_error(req, request_id, ex.code, unicode(ex))
             else:
@@ -505,7 +514,13 @@ class Executor(wsgi.Application):
         except exception.KeyPairExists as ex:
             LOG.debug(_('KeyPairExists raised: %s'), unicode(ex),
                      context=context)
-            return ec2_error(req, request_id, type(ex).__name__, unicode(ex))
+            code = 'InvalidKeyPair.Duplicate'
+            return ec2_error(req, request_id, code, unicode(ex))
+        except exception.InvalidKeypair as ex:
+            LOG.debug(_('InvalidKeypair raised: %s'), unicode(ex),
+                        context)
+            code = 'InvalidKeyPair.Format'
+            return ec2_error(req, request_id, code, unicode(ex))
         except exception.InvalidParameterValue as ex:
             LOG.debug(_('InvalidParameterValue raised: %s'), unicode(ex),
                      context=context)

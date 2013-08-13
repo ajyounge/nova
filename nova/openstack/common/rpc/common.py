@@ -18,16 +18,57 @@
 #    under the License.
 
 import copy
-import logging
+import sys
 import traceback
+
+from oslo.config import cfg
+import six
 
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova.openstack.common import local
+from nova.openstack.common import log as logging
 
 
+CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
+
+
+'''RPC Envelope Version.
+
+This version number applies to the top level structure of messages sent out.
+It does *not* apply to the message payload, which must be versioned
+independently.  For example, when using rpc APIs, a version number is applied
+for changes to the API being exposed over rpc.  This version number is handled
+in the rpc proxy and dispatcher modules.
+
+This version number applies to the message envelope that is used in the
+serialization done inside the rpc layer.  See serialize_msg() and
+deserialize_msg().
+
+The current message format (version 2.0) is very simple.  It is:
+
+    {
+        'oslo.version': <RPC Envelope Version as a String>,
+        'oslo.message': <Application Message Payload, JSON encoded>
+    }
+
+Message format version '1.0' is just considered to be the messages we sent
+without a message envelope.
+
+So, the current message envelope just includes the envelope version.  It may
+eventually contain additional information, such as a signature for the message
+payload.
+
+We will JSON encode the application message payload.  The message envelope,
+which includes the JSON encoded application message body, will be passed down
+to the messaging libraries as a dict.
+'''
+_RPC_ENVELOPE_VERSION = '2.0'
+
+_VERSION_KEY = 'oslo.version'
+_MESSAGE_KEY = 'oslo.message'
 
 
 class RPCException(Exception):
@@ -40,7 +81,7 @@ class RPCException(Exception):
             try:
                 message = self.message % kwargs
 
-            except Exception as e:
+            except Exception:
                 # kwargs doesn't match a variable in the message
                 # log the issue and the kwargs
                 LOG.exception(_('Exception in string format operation'))
@@ -78,7 +119,29 @@ class Timeout(RPCException):
     This exception is raised if the rpc_response_timeout is reached while
     waiting for a response from the remote side.
     """
-    message = _("Timeout while waiting on RPC response.")
+    message = _('Timeout while waiting on RPC response - '
+                'topic: "%(topic)s", RPC method: "%(method)s" '
+                'info: "%(info)s"')
+
+    def __init__(self, info=None, topic=None, method=None):
+        """
+        :param info: Extra info to convey to the user
+        :param topic: The topic that the rpc call was sent to
+        :param rpc_method_name: The name of the rpc method being
+                                called
+        """
+        self.info = info
+        self.topic = topic
+        self.method = method
+        super(Timeout, self).__init__(
+            None,
+            info=info or _('<unknown>'),
+            topic=topic or _('<unknown>'),
+            method=method or _('<unknown>'))
+
+
+class DuplicateMessageError(RPCException):
+    message = _("Found duplicate message(%(msg_id)s). Skipping it.")
 
 
 class InvalidRPCConnectionReuse(RPCException):
@@ -88,6 +151,15 @@ class InvalidRPCConnectionReuse(RPCException):
 class UnsupportedRpcVersion(RPCException):
     message = _("Specified RPC version, %(version)s, not supported by "
                 "this endpoint.")
+
+
+class UnsupportedRpcEnvelopeVersion(RPCException):
+    message = _("Specified RPC envelope version, %(version)s, "
+                "not supported by this endpoint.")
+
+
+class RpcVersionCapError(RPCException):
+    message = _("Specified RPC version cap, %(version_cap)s, is too low")
 
 
 class Connection(object):
@@ -148,6 +220,28 @@ class Connection(object):
         """
         raise NotImplementedError()
 
+    def join_consumer_pool(self, callback, pool_name, topic, exchange_name):
+        """Register as a member of a group of consumers for a given topic from
+        the specified exchange.
+
+        Exactly one member of a given pool will receive each message.
+
+        A message will be delivered to multiple pools, if more than
+        one is created.
+
+        :param callback: Callable to be invoked for each message.
+        :type callback: callable accepting one argument
+        :param pool_name: The name of the consumer pool.
+        :type pool_name: str
+        :param topic: The routing topic for desired messages.
+        :type topic: str
+        :param exchange_name: The name of the message exchange where
+                              the client should attach. Defaults to
+                              the configured exchange.
+        :type exchange_name: str
+        """
+        raise NotImplementedError()
+
     def consume_in_thread(self):
         """Spawn a thread to handle incoming messages.
 
@@ -164,8 +258,12 @@ class Connection(object):
 
 def _safe_log(log_func, msg, msg_data):
     """Sanitizes the msg_data field before logging."""
-    SANITIZE = {'set_admin_password': ('new_pass',),
-                'run_instance': ('admin_password',), }
+    SANITIZE = {'set_admin_password': [('args', 'new_pass')],
+                'run_instance': [('args', 'admin_password')],
+                'route_message': [('args', 'message', 'args', 'method_info',
+                                   'method_kwargs', 'password'),
+                                  ('args', 'message', 'args', 'method_info',
+                                   'method_kwargs', 'admin_password')]}
 
     has_method = 'method' in msg_data and msg_data['method'] in SANITIZE
     has_context_token = '_context_auth_token' in msg_data
@@ -177,14 +275,16 @@ def _safe_log(log_func, msg, msg_data):
     msg_data = copy.deepcopy(msg_data)
 
     if has_method:
-        method = msg_data['method']
-        if method in SANITIZE:
-            args_to_sanitize = SANITIZE[method]
-            for arg in args_to_sanitize:
-                try:
-                    msg_data['args'][arg] = "<SANITIZED>"
-                except KeyError:
-                    pass
+        for arg in SANITIZE.get(msg_data['method'], []):
+            try:
+                d = msg_data
+                for elem in arg[:-1]:
+                    d = d[elem]
+                d[arg[-1]] = '<SANITIZED>'
+            except KeyError as e:
+                LOG.info(_('Failed to sanitize %(item)s. Key error %(err)s'),
+                         {'item': arg,
+                          'err': e})
 
     if has_context_token:
         msg_data['_context_auth_token'] = '<SANITIZED>'
@@ -195,7 +295,7 @@ def _safe_log(log_func, msg, msg_data):
     return log_func(msg, msg_data)
 
 
-def serialize_remote_exception(failure_info):
+def serialize_remote_exception(failure_info, log_failure=True):
     """Prepares exception data to be sent over rpc.
 
     Failure_info should be a sys.exc_info() tuple.
@@ -203,8 +303,10 @@ def serialize_remote_exception(failure_info):
     """
     tb = traceback.format_exception(*failure_info)
     failure = failure_info[1]
-    LOG.error(_("Returning exception %s to caller"), unicode(failure))
-    LOG.error(tb)
+    if log_failure:
+        LOG.error(_("Returning exception %s to caller"),
+                  six.text_type(failure))
+        LOG.error(tb)
 
     kwargs = {}
     if hasattr(failure, 'kwargs'):
@@ -213,7 +315,7 @@ def serialize_remote_exception(failure_info):
     data = {
         'class': str(failure.__class__.__name__),
         'module': str(failure.__class__.__module__),
-        'message': unicode(failure),
+        'message': six.text_type(failure),
         'tb': tb,
         'args': failure.args,
         'kwargs': kwargs
@@ -234,7 +336,7 @@ def deserialize_remote_exception(conf, data):
 
     # NOTE(ameade): We DO NOT want to allow just any module to be imported, in
     # order to prevent arbitrary code execution.
-    if not module in conf.allowed_rpc_exception_modules:
+    if module not in conf.allowed_rpc_exception_modules:
         return RemoteError(name, failure.get('message'), trace)
 
     try:
@@ -243,7 +345,7 @@ def deserialize_remote_exception(conf, data):
         if not issubclass(klass, Exception):
             raise TypeError("Can only deserialize Exceptions")
 
-        failure = klass(**failure.get('kwargs', {}))
+        failure = klass(*failure.get('args', []), **failure.get('kwargs', {}))
     except (AttributeError, TypeError, ImportError):
         return RemoteError(name, failure.get('message'), trace)
 
@@ -258,7 +360,7 @@ def deserialize_remote_exception(conf, data):
         # we cannot necessarily change an exception message so we must override
         # the __str__ method.
         failure.__class__ = new_ex_type
-    except TypeError as e:
+    except TypeError:
         # NOTE(ameade): If a core exception then just add the traceback to the
         # first exception argument.
         failure.args = (message,) + failure.args[1:]
@@ -309,3 +411,104 @@ class CommonRpcContext(object):
             context.values['read_deleted'] = read_deleted
 
         return context
+
+
+class ClientException(Exception):
+    """This encapsulates some actual exception that is expected to be
+    hit by an RPC proxy object. Merely instantiating it records the
+    current exception information, which will be passed back to the
+    RPC client without exceptional logging."""
+    def __init__(self):
+        self._exc_info = sys.exc_info()
+
+
+def catch_client_exception(exceptions, func, *args, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        if type(e) in exceptions:
+            raise ClientException()
+        else:
+            raise
+
+
+def client_exceptions(*exceptions):
+    """Decorator for manager methods that raise expected exceptions.
+    Marking a Manager method with this decorator allows the declaration
+    of expected exceptions that the RPC layer should not consider fatal,
+    and not log as if they were generated in a real error scenario. Note
+    that this will cause listed exceptions to be wrapped in a
+    ClientException, which is used internally by the RPC layer."""
+    def outer(func):
+        def inner(*args, **kwargs):
+            return catch_client_exception(exceptions, func, *args, **kwargs)
+        return inner
+    return outer
+
+
+def version_is_compatible(imp_version, version):
+    """Determine whether versions are compatible.
+
+    :param imp_version: The version implemented
+    :param version: The version requested by an incoming message.
+    """
+    version_parts = version.split('.')
+    imp_version_parts = imp_version.split('.')
+    if int(version_parts[0]) != int(imp_version_parts[0]):  # Major
+        return False
+    if int(version_parts[1]) > int(imp_version_parts[1]):  # Minor
+        return False
+    return True
+
+
+def serialize_msg(raw_msg):
+    # NOTE(russellb) See the docstring for _RPC_ENVELOPE_VERSION for more
+    # information about this format.
+    msg = {_VERSION_KEY: _RPC_ENVELOPE_VERSION,
+           _MESSAGE_KEY: jsonutils.dumps(raw_msg)}
+
+    return msg
+
+
+def deserialize_msg(msg):
+    # NOTE(russellb): Hang on to your hats, this road is about to
+    # get a little bumpy.
+    #
+    # Robustness Principle:
+    #    "Be strict in what you send, liberal in what you accept."
+    #
+    # At this point we have to do a bit of guessing about what it
+    # is we just received.  Here is the set of possibilities:
+    #
+    # 1) We received a dict.  This could be 2 things:
+    #
+    #   a) Inspect it to see if it looks like a standard message envelope.
+    #      If so, great!
+    #
+    #   b) If it doesn't look like a standard message envelope, it could either
+    #      be a notification, or a message from before we added a message
+    #      envelope (referred to as version 1.0).
+    #      Just return the message as-is.
+    #
+    # 2) It's any other non-dict type.  Just return it and hope for the best.
+    #    This case covers return values from rpc.call() from before message
+    #    envelopes were used.  (messages to call a method were always a dict)
+
+    if not isinstance(msg, dict):
+        # See #2 above.
+        return msg
+
+    base_envelope_keys = (_VERSION_KEY, _MESSAGE_KEY)
+    if not all(map(lambda key: key in msg, base_envelope_keys)):
+        #  See #1.b above.
+        return msg
+
+    # At this point we think we have the message envelope
+    # format we were expecting. (#1.a above)
+
+    if not version_is_compatible(_RPC_ENVELOPE_VERSION, msg[_VERSION_KEY]):
+        raise UnsupportedRpcEnvelopeVersion(version=msg[_VERSION_KEY])
+
+    raw_msg = jsonutils.loads(msg[_MESSAGE_KEY])
+
+    return raw_msg

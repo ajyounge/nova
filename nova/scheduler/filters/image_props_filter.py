@@ -1,4 +1,4 @@
-# Copyright (c) 2011-2012 OpenStack, LLC
+# Copyright (c) 2011-2012 OpenStack Foundation
 # Copyright (c) 2012 Canonical Ltd
 # Copyright (c) 2012 SUSE LINUX Products GmbH
 # All Rights Reserved.
@@ -26,7 +26,7 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
     """Filter compute nodes that satisfy instance image properties.
 
     The ImagePropertiesFilter filters compute nodes that satisfy
-    any architecture, hpervisor type, or virtual machine mode properties
+    any architecture, hypervisor type, or virtual machine mode properties
     specified on the instance's image properties.  Image properties are
     contained in the image dictionary in the request_spec.
     """
@@ -47,7 +47,7 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
         if not supp_instances:
             LOG.debug(_("Instance contains properties %(image_props)s, "
                         "but no corresponding capabilities are advertised "
-                        "by the compute node"), locals())
+                        "by the compute node"), {'image_props': image_props})
             return False
 
         def _compare_props(props, other_props):
@@ -60,12 +60,16 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
             if _compare_props(checked_img_props, supp_inst):
                 LOG.debug(_("Instance properties %(image_props)s "
                             "are satisfied by compute host capabilities "
-                            "%(capabilities)s"), locals())
+                            "%(capabilities)s"),
+                            {'image_props': image_props,
+                             'capabilities': capabilities})
                 return True
 
         LOG.debug(_("Instance contains properties %(image_props)s "
                     "that are not provided by the compute node "
-                    "capabilities %(capabilities)s"), locals())
+                    "capabilities %(capabilities)s"),
+                  {'image_props': image_props,
+                   'capabilities': capabilities})
         return False
 
     def host_passes(self, host_state, filter_properties):
@@ -80,6 +84,6 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
 
         if not self._instance_supported(capabilities, image_props):
             LOG.debug(_("%(host_state)s does not support requested "
-                        "instance_properties"), locals())
+                        "instance_properties"), {'host_state': host_state})
             return False
         return True

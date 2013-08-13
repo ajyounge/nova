@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2010 OpenStack LLC.
+# Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,12 +16,13 @@
 #    under the License.
 
 import functools
+import itertools
 import os
 import re
 import urlparse
 
+from oslo.config import cfg
 import webob
-from xml.dom import minidom
 
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
@@ -29,13 +30,27 @@ from nova.compute import task_states
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 from nova import exception
-from nova import flags
 from nova.openstack.common import log as logging
 from nova import quota
 
+osapi_opts = [
+    cfg.IntOpt('osapi_max_limit',
+               default=1000,
+               help='the maximum number of items returned in a single '
+                    'response from a collection resource'),
+    cfg.StrOpt('osapi_compute_link_prefix',
+               default=None,
+               help='Base URL that will be presented to users in links '
+                    'to the OpenStack Compute API'),
+    cfg.StrOpt('osapi_glance_link_prefix',
+               default=None,
+               help='Base URL that will be presented to users in links '
+                    'to glance resources'),
+]
+CONF = cfg.CONF
+CONF.register_opts(osapi_opts)
 
 LOG = logging.getLogger(__name__)
-FLAGS = flags.FLAGS
 QUOTAS = quota.QUOTAS
 
 
@@ -98,7 +113,8 @@ def status_from_state(vm_state, task_state='default'):
     if status == "UNKNOWN":
         LOG.error(_("status is UNKNOWN from vm_state=%(vm_state)s "
                     "task_state=%(task_state)s. Bad upgrade or db "
-                    "corrupted?") % locals())
+                    "corrupted?"),
+                  {'vm_state': vm_state, 'task_state': task_state})
     return status
 
 
@@ -131,7 +147,7 @@ def get_pagination_params(request):
 
 
 def _get_limit_param(request):
-    """Extract integer limit from request or fail"""
+    """Extract integer limit from request or fail."""
     try:
         limit = int(request.GET['limit'])
     except ValueError:
@@ -144,11 +160,11 @@ def _get_limit_param(request):
 
 
 def _get_marker_param(request):
-    """Extract marker id from request or fail"""
+    """Extract marker id from request or fail."""
     return request.GET['marker']
 
 
-def limited(items, request, max_limit=FLAGS.osapi_max_limit):
+def limited(items, request, max_limit=CONF.osapi_max_limit):
     """Return a slice of items according to requested offset and limit.
 
     :param items: A sliceable entity
@@ -185,8 +201,8 @@ def limited(items, request, max_limit=FLAGS.osapi_max_limit):
     return items[offset:range_end]
 
 
-def get_limit_and_marker(request, max_limit=FLAGS.osapi_max_limit):
-    """get limited parameter from request"""
+def get_limit_and_marker(request, max_limit=CONF.osapi_max_limit):
+    """get limited parameter from request."""
     params = get_pagination_params(request)
     limit = params.get('limit', max_limit)
     limit = min(max_limit, limit)
@@ -195,7 +211,7 @@ def get_limit_and_marker(request, max_limit=FLAGS.osapi_max_limit):
     return limit, marker
 
 
-def limited_by_marker(items, request, max_limit=FLAGS.osapi_max_limit):
+def limited_by_marker(items, request, max_limit=CONF.osapi_max_limit):
     """Return a slice of items according to the requested marker and limit."""
     limit, marker = get_limit_and_marker(request, max_limit)
 
@@ -306,6 +322,9 @@ def get_networks_for_instance_from_nw_info(nw_info):
 
         networks[label]['ips'].extend(ips)
         networks[label]['floating_ips'].extend(floaters)
+        for ip in itertools.chain(networks[label]['ips'],
+                                  networks[label]['floating_ips']):
+            ip['mac_address'] = vif['address']
     return networks
 
 
@@ -314,10 +333,18 @@ def get_networks_for_instance(context, instance):
 
     We end up with a data structure like::
 
-        {'public': {'ips': [{'addr': '10.0.0.1', 'version': 4},
-                            {'addr': '2001::1', 'version': 6}],
-                    'floating_ips': [{'addr': '172.16.0.1', 'version': 4},
-                                     {'addr': '172.16.2.1', 'version': 4}]},
+        {'public': {'ips': [{'address': '10.0.0.1',
+                             'version': 4,
+                             'mac_address': 'aa:aa:aa:aa:aa:aa'},
+                            {'address': '2001::1',
+                             'version': 6,
+                             'mac_address': 'aa:aa:aa:aa:aa:aa'}],
+                    'floating_ips': [{'address': '172.16.0.1',
+                                      'version': 4,
+                                      'mac_address': 'aa:aa:aa:aa:aa:aa'},
+                                     {'address': '172.16.2.1',
+                                      'version': 4,
+                                      'mac_address': 'aa:aa:aa:aa:aa:aa'}]},
          ...}
     """
     nw_info = compute_utils.get_nw_info_for_instance(instance)
@@ -331,17 +358,21 @@ def raise_http_conflict_for_instance_invalid_state(exc, action):
     """
     attr = exc.kwargs.get('attr')
     state = exc.kwargs.get('state')
+    not_launched = exc.kwargs.get('not_launched')
     if attr and state:
-        msg = _("Cannot '%(action)s' while instance is in %(attr)s %(state)s")
+        msg = _("Cannot '%(action)s' while instance is in %(attr)s "
+                "%(state)s") % {'action': action, 'attr': attr, 'state': state}
+    elif not_launched:
+        msg = _("Cannot '%s' an instance which has never been active") % action
     else:
         # At least give some meaningful message
-        msg = _("Instance is in an invalid state for '%(action)s'")
-    raise webob.exc.HTTPConflict(explanation=msg % locals())
+        msg = _("Instance is in an invalid state for '%s'") % action
+    raise webob.exc.HTTPConflict(explanation=msg)
 
 
 class MetadataDeserializer(wsgi.MetadataXMLDeserializer):
     def deserialize(self, text):
-        dom = minidom.parseString(text)
+        dom = xmlutil.safe_minidom_parse_string(text)
         metadata_node = self.find_first_child_named(dom, "metadata")
         metadata = self.extract_metadata(metadata_node)
         return {'body': {'metadata': metadata}}
@@ -349,7 +380,7 @@ class MetadataDeserializer(wsgi.MetadataXMLDeserializer):
 
 class MetaItemDeserializer(wsgi.MetadataXMLDeserializer):
     def deserialize(self, text):
-        dom = minidom.parseString(text)
+        dom = xmlutil.safe_minidom_parse_string(text)
         metadata_item = self.extract_metadata(dom)
         return {'body': {'meta': metadata_item}}
 
@@ -357,7 +388,7 @@ class MetaItemDeserializer(wsgi.MetadataXMLDeserializer):
 class MetadataXMLDeserializer(wsgi.XMLDeserializer):
 
     def extract_metadata(self, metadata_node):
-        """Marshal the metadata attribute of a parsed request"""
+        """Marshal the metadata attribute of a parsed request."""
         if metadata_node is None:
             return {}
         metadata = {}
@@ -367,7 +398,7 @@ class MetadataXMLDeserializer(wsgi.XMLDeserializer):
         return metadata
 
     def _extract_metadata_container(self, datastring):
-        dom = minidom.parseString(datastring)
+        dom = xmlutil.safe_minidom_parse_string(datastring)
         metadata_node = self.find_first_child_named(dom, "metadata")
         metadata = self.extract_metadata(metadata_node)
         return {'body': {'metadata': metadata}}
@@ -379,7 +410,7 @@ class MetadataXMLDeserializer(wsgi.XMLDeserializer):
         return self._extract_metadata_container(datastring)
 
     def update(self, datastring):
-        dom = minidom.parseString(datastring)
+        dom = xmlutil.safe_minidom_parse_string(datastring)
         metadata_item = self.extract_metadata(dom)
         return {'body': {'meta': metadata_item}}
 
@@ -414,7 +445,7 @@ class MetadataTemplate(xmlutil.TemplateBuilder):
 def check_snapshots_enabled(f):
     @functools.wraps(f)
     def inner(*args, **kwargs):
-        if not FLAGS.allow_instance_snapshots:
+        if not CONF.allow_instance_snapshots:
             LOG.warn(_('Rejecting snapshot request, snapshots currently'
                        ' disabled'))
             msg = _("Instance snapshots are not permitted at this time.")
@@ -425,6 +456,16 @@ def check_snapshots_enabled(f):
 
 class ViewBuilder(object):
     """Model API responses as dictionaries."""
+
+    def _get_project_id(self, request):
+        """
+        Get project id from request url if present or empty string
+        otherwise
+        """
+        project_id = request.environ["nova.context"].project_id
+        if project_id in request.url:
+            return project_id
+        return ''
 
     def _get_links(self, request, identifier, collection_name):
         return [{
@@ -442,29 +483,26 @@ class ViewBuilder(object):
         """Return href string with proper limit and marker params."""
         params = request.params.copy()
         params["marker"] = identifier
-        prefix = self._update_link_prefix(request.application_url,
-                                          FLAGS.osapi_compute_link_prefix)
+        prefix = self._update_compute_link_prefix(request.application_url)
         url = os.path.join(prefix,
-                           request.environ["nova.context"].project_id,
+                           self._get_project_id(request),
                            collection_name)
         return "%s?%s" % (url, dict_to_query_str(params))
 
     def _get_href_link(self, request, identifier, collection_name):
         """Return an href string pointing to this object."""
-        prefix = self._update_link_prefix(request.application_url,
-                                          FLAGS.osapi_compute_link_prefix)
+        prefix = self._update_compute_link_prefix(request.application_url)
         return os.path.join(prefix,
-                            request.environ["nova.context"].project_id,
+                            self._get_project_id(request),
                             collection_name,
                             str(identifier))
 
     def _get_bookmark_link(self, request, identifier, collection_name):
         """Create a URL that refers to a specific resource."""
         base_url = remove_version_from_href(request.application_url)
-        base_url = self._update_link_prefix(base_url,
-                                            FLAGS.osapi_compute_link_prefix)
+        base_url = self._update_compute_link_prefix(base_url)
         return os.path.join(base_url,
-                            request.environ["nova.context"].project_id,
+                            self._get_project_id(request),
                             collection_name,
                             str(identifier))
 
@@ -499,3 +537,11 @@ class ViewBuilder(object):
         prefix_parts = list(urlparse.urlsplit(prefix))
         url_parts[0:2] = prefix_parts[0:2]
         return urlparse.urlunsplit(url_parts)
+
+    def _update_glance_link_prefix(self, orig_url):
+        return self._update_link_prefix(orig_url,
+                                        CONF.osapi_glance_link_prefix)
+
+    def _update_compute_link_prefix(self, orig_url):
+        return self._update_link_prefix(orig_url,
+                                        CONF.osapi_compute_link_prefix)

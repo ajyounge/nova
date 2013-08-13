@@ -3,7 +3,6 @@
 
 # Copyright 2012 SINA Corporation
 # All Rights Reserved.
-# Author: Zhongyue Luo <lzyeval@gmail.com>
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -16,10 +15,15 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# @author: Zhongyue Luo, Intel Corporation.
+#
 
-FILES=$(find nova -type f -name "*.py" ! -path "nova/tests/*" -exec \
-    grep -l "Opt(" {} \; | sort -u)
+FILES=$(find nova -type f -name "*.py" ! -path "nova/tests/*" \
+        -exec grep -l "Opt(" {} + | sort -u)
 
-PYTHONPATH=./:${PYTHONPATH} \
-    python $(dirname "$0")/extract_opts.py ${FILES} > \
-    etc/nova/nova.conf.sample
+export EVENTLET_NO_GREENDNS=yes
+
+MODULEPATH=$(dirname "$0")/../../nova/openstack/common/config/generator.py
+OUTPUTPATH=etc/nova/nova.conf.sample
+PYTHONPATH=./:${PYTHONPATH} python $MODULEPATH $FILES > $OUTPUTPATH

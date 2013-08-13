@@ -1,4 +1,4 @@
-# Copyright 2012 OpenStack LLC.
+# Copyright 2012 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,15 +19,15 @@ from lxml import etree
 from webob import exc
 
 from nova.api.openstack.compute.contrib import flavor_access
-from nova.api.openstack.compute import flavors
-from nova.compute import instance_types
+from nova.api.openstack.compute import flavors as flavors_api
+from nova.compute import flavors
 from nova import context
 from nova import exception
 from nova import test
 from nova.tests.api.openstack import fakes
 
 
-def generate_instance_type(flavorid, ispublic):
+def generate_flavor(flavorid, ispublic):
     return {
         'id': flavorid,
         'flavorid': str(flavorid),
@@ -49,10 +49,10 @@ def generate_instance_type(flavorid, ispublic):
 
 
 INSTANCE_TYPES = {
-        '0': generate_instance_type(0, True),
-        '1': generate_instance_type(1, True),
-        '2': generate_instance_type(2, False),
-        '3': generate_instance_type(3, False)}
+        '0': generate_flavor(0, True),
+        '1': generate_flavor(1, True),
+        '2': generate_flavor(2, False),
+        '3': generate_flavor(3, False)}
 
 
 ACCESS_LIST = [{'flavor_id': '2', 'project_id': 'proj2'},
@@ -60,7 +60,7 @@ ACCESS_LIST = [{'flavor_id': '2', 'project_id': 'proj2'},
                {'flavor_id': '3', 'project_id': 'proj3'}]
 
 
-def fake_get_instance_type_access_by_flavor_id(flavorid):
+def fake_get_flavor_access_by_flavor_id(flavorid):
     res = []
     for access in ACCESS_LIST:
         if access['flavor_id'] == flavorid:
@@ -68,7 +68,7 @@ def fake_get_instance_type_access_by_flavor_id(flavorid):
     return res
 
 
-def fake_get_instance_type_by_flavor_id(flavorid):
+def fake_get_flavor_by_flavor_id(flavorid):
     return INSTANCE_TYPES[flavorid]
 
 
@@ -80,7 +80,7 @@ def _has_flavor_access(flavorid, projectid):
     return False
 
 
-def fake_get_all_types(context, inactive=0, filters=None):
+def fake_get_all_flavors(context, inactive=0, filters=None):
     if filters == None or filters['is_public'] == None:
         return INSTANCE_TYPES
 
@@ -98,20 +98,34 @@ def fake_get_all_types(context, inactive=0, filters=None):
 class FakeRequest(object):
     environ = {"nova.context": context.get_admin_context()}
 
+    def get_db_flavor(self, flavor_id):
+        return INSTANCE_TYPES[flavor_id]
+
+
+class FakeResponse(object):
+    obj = {'flavor': {'id': '0'},
+           'flavors': [
+               {'id': '0'},
+               {'id': '2'}]
+    }
+
+    def attach(self, **kwargs):
+        pass
+
 
 class FlavorAccessTest(test.TestCase):
     def setUp(self):
         super(FlavorAccessTest, self).setUp()
-        self.flavor_controller = flavors.Controller()
+        self.flavor_controller = flavors_api.Controller()
         self.flavor_access_controller = flavor_access.FlavorAccessController()
         self.flavor_action_controller = flavor_access.FlavorActionController()
         self.req = FakeRequest()
         self.context = self.req.environ['nova.context']
-        self.stubs.Set(instance_types, 'get_instance_type_by_flavor_id',
-                       fake_get_instance_type_by_flavor_id)
-        self.stubs.Set(instance_types, 'get_all_types', fake_get_all_types)
-        self.stubs.Set(instance_types, 'get_instance_type_access_by_flavor_id',
-                       fake_get_instance_type_access_by_flavor_id)
+        self.stubs.Set(flavors, 'get_flavor_by_flavor_id',
+                       fake_get_flavor_by_flavor_id)
+        self.stubs.Set(flavors, 'get_all_flavors', fake_get_all_flavors)
+        self.stubs.Set(flavors, 'get_flavor_access_by_flavor_id',
+                       fake_get_flavor_access_by_flavor_id)
 
     def _verify_flavor_list(self, result, expected):
         # result already sorted by flavor_id
@@ -209,12 +223,34 @@ class FlavorAccessTest(test.TestCase):
         result = self.flavor_controller.index(req)
         self._verify_flavor_list(result['flavors'], expected['flavors'])
 
+    def test_show(self):
+        resp = FakeResponse()
+        self.flavor_action_controller.show(self.req, resp, '0')
+        self.assertEqual({'id': '0', 'os-flavor-access:is_public': True},
+                         resp.obj['flavor'])
+        self.flavor_action_controller.show(self.req, resp, '2')
+        self.assertEqual({'id': '0', 'os-flavor-access:is_public': False},
+                         resp.obj['flavor'])
+
+    def test_detail(self):
+        resp = FakeResponse()
+        self.flavor_action_controller.detail(self.req, resp)
+        self.assertEqual([{'id': '0', 'os-flavor-access:is_public': True},
+                          {'id': '2', 'os-flavor-access:is_public': False}],
+                         resp.obj['flavors'])
+
+    def test_create(self):
+        resp = FakeResponse()
+        self.flavor_action_controller.create(self.req, {}, resp)
+        self.assertEqual({'id': '0', 'os-flavor-access:is_public': True},
+                         resp.obj['flavor'])
+
     def test_add_tenant_access(self):
-        def stub_add_instance_type_access(flavorid, projectid, ctxt=None):
+        def stub_add_flavor_access(flavorid, projectid, ctxt=None):
             self.assertEqual('3', flavorid, "flavorid")
             self.assertEqual("proj2", projectid, "projectid")
-        self.stubs.Set(instance_types, 'add_instance_type_access',
-                       stub_add_instance_type_access)
+        self.stubs.Set(flavors, 'add_flavor_access',
+                       stub_add_flavor_access)
         expected = {'flavor_access':
             [{'flavor_id': '3', 'tenant_id': 'proj3'}]}
         body = {'addTenantAccess': {'tenant': 'proj2'}}
@@ -225,10 +261,11 @@ class FlavorAccessTest(test.TestCase):
         self.assertEqual(result, expected)
 
     def test_add_tenant_access_with_already_added_access(self):
-        def stub_add_instance_type_access(flavorid, projectid, ctxt=None):
-            raise exception.FlavorAccessExists()
-        self.stubs.Set(instance_types, 'add_instance_type_access',
-                       stub_add_instance_type_access)
+        def stub_add_flavor_access(flavorid, projectid, ctxt=None):
+            raise exception.FlavorAccessExists(flavor_id=flavorid,
+                                               project_id=projectid)
+        self.stubs.Set(flavors, 'add_flavor_access',
+                       stub_add_flavor_access)
         body = {'addTenantAccess': {'tenant': 'proj2'}}
         req = fakes.HTTPRequest.blank('/v2/fake/flavors/2/action',
                                       use_admin_context=True)
@@ -237,25 +274,11 @@ class FlavorAccessTest(test.TestCase):
                           self.req, '3', body)
 
     def test_remove_tenant_access_with_bad_access(self):
-        def stub_remove_instance_type_access(flavorid, projectid, ctxt=None):
-            self.assertEqual('3', flavorid, "flavorid")
-            self.assertEqual("proj2", projectid, "projectid")
-        expected = {'flavor_access': [
-            {'flavor_id': '3', 'tenant_id': 'proj3'}]}
-        self.stubs.Set(instance_types, 'remove_instance_type_access',
-                       stub_remove_instance_type_access)
-        body = {'removeTenantAccess': {'tenant': 'proj2'}}
-        req = fakes.HTTPRequest.blank('/v2/fake/flavors/2/action',
-                                      use_admin_context=True)
-        result = self.flavor_action_controller.\
-            _addTenantAccess(req, '3', body)
-        self.assertEqual(result, expected)
-
-    def test_remove_tenant_access_with_bad_access(self):
-        def stub_remove_instance_type_access(flavorid, projectid, ctxt=None):
-            raise exception.FlavorAccessNotFound()
-        self.stubs.Set(instance_types, 'remove_instance_type_access',
-                       stub_remove_instance_type_access)
+        def stub_remove_flavor_access(flavorid, projectid, ctxt=None):
+            raise exception.FlavorAccessNotFound(flavor_id=flavorid,
+                                                 project_id=projectid)
+        self.stubs.Set(flavors, 'remove_flavor_access',
+                       stub_remove_flavor_access)
         body = {'removeTenantAccess': {'tenant': 'proj2'}}
         req = fakes.HTTPRequest.blank('/v2/fake/flavors/2/action',
                                       use_admin_context=True)
@@ -265,35 +288,21 @@ class FlavorAccessTest(test.TestCase):
 
 
 class FlavorAccessSerializerTest(test.TestCase):
-    def test_xml_declaration(self):
-        access_list = [{'flavor_id': '2', 'tenant_id': 'proj2'}]
-        serializer = flavor_access.FlavorAccessTemplate()
-        output = serializer.serialize(access_list)
-        has_dec = output.startswith("<?xml version='1.0' encoding='UTF-8'?>")
-        self.assertTrue(has_dec)
-
     def test_serializer_empty(self):
-        access_list = []
-
         serializer = flavor_access.FlavorAccessTemplate()
-        text = serializer.serialize(access_list)
+        text = serializer.serialize(dict(flavor_access=[]))
         tree = etree.fromstring(text)
         self.assertEqual(len(tree), 0)
 
     def test_serializer(self):
+        expected = ("<?xml version='1.0' encoding='UTF-8'?>\n"
+                    '<flavor_access>'
+                    '<access tenant_id="proj2" flavor_id="2"/>'
+                    '<access tenant_id="proj3" flavor_id="2"/>'
+                    '</flavor_access>')
         access_list = [{'flavor_id': '2', 'tenant_id': 'proj2'},
                        {'flavor_id': '2', 'tenant_id': 'proj3'}]
 
         serializer = flavor_access.FlavorAccessTemplate()
-        text = serializer.serialize(access_list)
-        tree = etree.fromstring(text)
-
-        self.assertEqual('flavor_access', tree.tag)
-        self.assertEqual(len(access_list), len(tree))
-
-        for i in range(len(access_list)):
-            self.assertEqual('access', tree[i].tag)
-            self.assertEqual(access_list[i]['flavor_id'],
-                             tree[i].get('flavor_id'))
-            self.assertEqual(access_list[i]['tenant_id'],
-                             tree[i].get('tenant_id'))
+        text = serializer.serialize(dict(flavor_access=access_list))
+        self.assertEqual(text, expected)

@@ -7,6 +7,7 @@ from nova.api.openstack import wsgi
 from nova import exception
 from nova import test
 from nova.tests.api.openstack import fakes
+from nova.tests import utils
 
 
 class RequestTest(test.TestCase):
@@ -170,6 +171,35 @@ class JSONDeserializerTest(test.TestCase):
         deserializer = wsgi.JSONDeserializer()
         self.assertEqual(deserializer.deserialize(data), as_dict)
 
+    def test_json_valid_utf8(self):
+        data = """{"server": {"min_count": 1, "flavorRef": "1",
+                "name": "\xe6\xa6\x82\xe5\xbf\xb5",
+                "imageRef": "10bab10c-1304-47d",
+                "max_count": 1}} """
+        as_dict = {
+            'body': {
+                u'server': {
+                            u'min_count': 1, u'flavorRef': u'1',
+                            u'name': u'\u6982\u5ff5',
+                            u'imageRef': u'10bab10c-1304-47d',
+                            u'max_count': 1
+                           }
+                    }
+            }
+        deserializer = wsgi.JSONDeserializer()
+        self.assertEqual(deserializer.deserialize(data), as_dict)
+
+    def test_json_invalid_utf8(self):
+        """ Send invalid utf-8 to JSONDeserializer"""
+        data = """{"server": {"min_count": 1, "flavorRef": "1",
+                "name": "\xf0\x28\x8c\x28",
+                "imageRef": "10bab10c-1304-47d",
+                "max_count": 1}} """
+
+        deserializer = wsgi.JSONDeserializer()
+        self.assertRaises(exception.MalformedRequestBody,
+                          deserializer.deserialize, data)
+
 
 class XMLDeserializerTest(test.TestCase):
     def test_xml(self):
@@ -196,10 +226,23 @@ class XMLDeserializerTest(test.TestCase):
         self.assertEqual(deserializer.deserialize(xml), as_dict)
 
     def test_xml_empty(self):
-        xml = """<a></a>"""
+        xml = '<a></a>'
         as_dict = {"body": {"a": {}}}
         deserializer = wsgi.XMLDeserializer()
         self.assertEqual(deserializer.deserialize(xml), as_dict)
+
+    def test_xml_valid_utf8(self):
+        xml = """ <a><name>\xe6\xa6\x82\xe5\xbf\xb5</name></a> """
+        deserializer = wsgi.XMLDeserializer()
+        as_dict = {'body': {u'a': {u'name': u'\u6982\u5ff5'}}}
+        self.assertEqual(deserializer.deserialize(xml), as_dict)
+
+    def test_xml_invalid_utf8(self):
+        """ Send invalid utf-8 to XMLDeserializer"""
+        xml = """ <a><name>\xf0\x28\x8c\x28</name></a> """
+        deserializer = wsgi.XMLDeserializer()
+        self.assertRaises(exception.MalformedRequestBody,
+                         deserializer.deserialize, xml)
 
 
 class ResourceTest(test.TestCase):
@@ -271,6 +314,21 @@ class ResourceTest(test.TestCase):
                                                  'application/xml',
                                                  '<fooAction>true</fooAction>')
         self.assertEqual(controller._action_foo, method)
+
+    def test_get_method_action_corrupt_xml(self):
+        class Controller(wsgi.Controller):
+            @wsgi.action('fooAction')
+            def _action_foo(self, req, id, body):
+                return body
+
+        controller = Controller()
+        resource = wsgi.Resource(controller)
+        self.assertRaises(
+                exception.MalformedRequestBody,
+                resource.get_method,
+                None, 'action',
+                'application/xml',
+                utils.killer_xml_body())
 
     def test_get_method_action_bad_body(self):
         class Controller(wsgi.Controller):
@@ -390,6 +448,49 @@ class ResourceTest(test.TestCase):
         content_type, body = resource.get_body(request)
         self.assertEqual(content_type, 'application/json')
         self.assertEqual(body, 'foo')
+
+    def test_get_request_id_with_dict_response_body(self):
+        class Controller(wsgi.Controller):
+            def index(self, req):
+                return {'foo': 'bar'}
+
+        req = fakes.HTTPRequest.blank('/tests')
+        context = req.environ['nova.context']
+        app = fakes.TestRouter(Controller())
+        response = req.get_response(app)
+        self.assertEqual(response.headers['x-compute-request-id'],
+                context.request_id)
+        self.assertEqual(response.body, '{"foo": "bar"}')
+        self.assertEqual(response.status_int, 200)
+
+    def test_no_request_id_with_str_response_body(self):
+        class Controller(wsgi.Controller):
+            def index(self, req):
+                return 'foo'
+
+        req = fakes.HTTPRequest.blank('/tests')
+        app = fakes.TestRouter(Controller())
+        response = req.get_response(app)
+        # NOTE(alaski): This test is really to ensure that a str response
+        # doesn't error.  Not having a request_id header is a side effect of
+        # our wsgi setup, ideally it would be there.
+        self.assertFalse(hasattr(response.headers, 'x-compute-request-id'))
+        self.assertEqual(response.body, 'foo')
+        self.assertEqual(response.status_int, 200)
+
+    def test_get_request_id_no_response_body(self):
+        class Controller(object):
+            def index(self, req):
+                pass
+
+        req = fakes.HTTPRequest.blank('/tests')
+        context = req.environ['nova.context']
+        app = fakes.TestRouter(Controller())
+        response = req.get_response(app)
+        self.assertEqual(response.headers['x-compute-request-id'],
+                context.request_id)
+        self.assertEqual(response.body, '')
+        self.assertEqual(response.status_int, 200)
 
     def test_deserialize_badtype(self):
         class Controller(object):
@@ -753,7 +854,7 @@ class ResourceTest(test.TestCase):
         self.assertEqual(response, 'foo')
 
     def test_resource_exception_handler_type_error(self):
-        """A TypeError should be translated to a Fault/HTTP 400"""
+        # A TypeError should be translated to a Fault/HTTP 400.
         def foo(a,):
             return a
 
@@ -763,6 +864,33 @@ class ResourceTest(test.TestCase):
             self.fail("Should have raised a Fault (HTTP 400)")
         except wsgi.Fault as fault:
             self.assertEqual(400, fault.status_int)
+
+    def test_resource_valid_utf8_body(self):
+        class Controller(object):
+            def index(self, req, body):
+                return body
+
+        req = webob.Request.blank('/tests')
+        body = """ {"name": "\xe6\xa6\x82\xe5\xbf\xb5" } """
+        expected_body = '{"name": "\\u6982\\u5ff5"}'
+        req.body = body
+        req.headers['Content-Type'] = 'application/json'
+        app = fakes.TestRouter(Controller())
+        response = req.get_response(app)
+        self.assertEqual(response.body, expected_body)
+        self.assertEqual(response.status_int, 200)
+
+    def test_resource_invalid_utf8(self):
+        class Controller(object):
+            def index(self, req, body):
+                return body
+
+        req = webob.Request.blank('/tests')
+        body = """ {"name": "\xf0\x28\x8c\x28" } """
+        req.body = body
+        req.headers['Content-Type'] = 'application/json'
+        app = fakes.TestRouter(Controller())
+        self.assertRaises(UnicodeDecodeError, req.get_response, app)
 
 
 class ResponseObjectTest(test.TestCase):
@@ -851,6 +979,7 @@ class ResponseObjectTest(test.TestCase):
                                    atom=AtomSerializer)
         robj['X-header1'] = 'header1'
         robj['X-header2'] = 'header2'
+        robj['X-header3'] = 3
 
         for content_type, mtype in wsgi._MEDIA_TYPE_MAP.items():
             request = wsgi.Request.blank('/tests/123')
@@ -859,6 +988,7 @@ class ResponseObjectTest(test.TestCase):
             self.assertEqual(response.headers['Content-Type'], content_type)
             self.assertEqual(response.headers['X-header1'], 'header1')
             self.assertEqual(response.headers['X-header2'], 'header2')
+            self.assertEqual(response.headers['X-header3'], '3')
             self.assertEqual(response.status_int, 202)
             self.assertEqual(response.body, mtype)
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright (c) 2010 Citrix Systems, Inc.
-# Copyright 2010 OpenStack LLC.
+# Copyright 2010 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -38,7 +38,7 @@ pluginlib.configure_logging("xenstore")
 
 
 class XenstoreError(pluginlib.PluginError):
-    """Errors that occur when calling xenstore-* through subprocesses"""
+    """Errors that occur when calling xenstore-* through subprocesses."""
 
     def __init__(self, cmd, return_code, stderr, stdout):
         msg = "cmd: %s; returncode: %d; stderr: %s; stdout: %s"
@@ -159,7 +159,13 @@ def delete_record(self, arg_dict):
     VM and the specified path from xenstore.
     """
     cmd = ["xenstore-rm", "/local/domain/%(dom_id)s/%(path)s" % arg_dict]
-    ret, result = _run_command(cmd)
+    try:
+        ret, result = _run_command(cmd)
+    except XenstoreError, e:
+        if 'could not remove path' in e.stderr:
+            # Entry already gone.  We're good to go.
+            return ''
+        raise
     return result
 
 

@@ -50,10 +50,12 @@
 A fake XenAPI SDK.
 """
 
+import base64
 import pickle
 import random
 import uuid
 from xml.sax import saxutils
+import zlib
 
 import pprint
 
@@ -74,7 +76,8 @@ LOG = logging.getLogger(__name__)
 def log_db_contents(msg=None):
     text = msg or ""
     content = pprint.pformat(_db_content)
-    LOG.debug(_("%(text)s: _db_content => %(content)s") % locals())
+    LOG.debug(_("%(text)s: _db_content => %(content)s"),
+              {'text': text, 'content': content})
 
 
 def reset():
@@ -89,7 +92,7 @@ def reset():
 
 
 def reset_table(table):
-    if not table in _CLASSES:
+    if table not in _CLASSES:
         return
     _db_content[table] = {}
 
@@ -172,7 +175,7 @@ def create_vdi(name_label, sr_ref, **kwargs):
         'other_config': {},
         'location': '',
         'xenstore_data': {},
-        'sm_config': {},
+        'sm_config': {'vhd-parent': None},
         'physical_utilisation': '123',
         'managed': True,
     }
@@ -198,7 +201,8 @@ def create_vbd(vm_ref, vdi_ref, userdevice=0):
 
 def after_VBD_create(vbd_ref, vbd_rec):
     """Create read-only fields and backref from VM and VDI to VBD when VBD
-    is created."""
+    is created.
+    """
     vbd_rec['currently_attached'] = False
     vbd_rec['device'] = ''
 
@@ -206,12 +210,13 @@ def after_VBD_create(vbd_ref, vbd_rec):
     vm_rec = _db_content['VM'][vm_ref]
     vm_rec['VBDs'].append(vbd_ref)
 
-    vdi_ref = vbd_rec['VDI']
-    vdi_rec = _db_content['VDI'][vdi_ref]
-    vdi_rec['VBDs'].append(vbd_ref)
-
     vm_name_label = _db_content['VM'][vm_ref]['name_label']
     vbd_rec['vm_name_label'] = vm_name_label
+
+    vdi_ref = vbd_rec['VDI']
+    if vdi_ref and vdi_ref != "OpaqueRef:NULL":
+        vdi_rec = _db_content['VDI'][vdi_ref]
+        vdi_rec['VBDs'].append(vbd_ref)
 
 
 def after_VM_create(vm_ref, vm_rec):
@@ -221,6 +226,7 @@ def after_VM_create(vm_ref, vm_rec):
     vm_rec.setdefault('memory_dynamic_max', str(8 * 1024 * 1024 * 1024))
     vm_rec.setdefault('VCPUs_max', str(4))
     vm_rec.setdefault('VBDs', [])
+    vm_rec.setdefault('resident_on', '')
 
 
 def create_pbd(config, host_ref, sr_ref, attached):
@@ -239,7 +245,8 @@ def create_task(name_label):
 
 def create_local_pifs():
     """Adds a PIF for each to the local database with VLAN=-1.
-       Do this one per host."""
+       Do this one per host.
+    """
     for host_ref in _db_content['host'].keys():
         _create_local_pif(host_ref)
 
@@ -247,7 +254,8 @@ def create_local_pifs():
 def create_local_srs():
     """Create an SR that looks like the one created on the local disk by
     default by the XenServer installer.  Do this one per host. Also, fake
-    the installation of an ISO SR."""
+    the installation of an ISO SR.
+    """
     for host_ref in _db_content['host'].keys():
         create_sr(name_label='Local storage',
                   type='lvm',
@@ -361,7 +369,8 @@ def check_for_session_leaks():
 
 def as_value(s):
     """Helper function for simulating XenAPI plugin responses.  It
-    escapes and wraps the given argument."""
+    escapes and wraps the given argument.
+    """
     return '<value>%s</value>' % saxutils.escape(s)
 
 
@@ -369,7 +378,8 @@ def as_json(*args, **kwargs):
     """Helper function for simulating XenAPI plugin responses for those
     that are returning JSON.  If this function is given plain arguments,
     then these are rendered as a JSON list.  If it's given keyword
-    arguments then these are rendered as a JSON dict."""
+    arguments then these are rendered as a JSON dict.
+    """
     arg = args or kwargs
     return jsonutils.dumps(arg)
 
@@ -400,6 +410,12 @@ class SessionBase(object):
     def pool_get_default_SR(self, _1, pool_ref):
         return 'FAKE DEFAULT SR'
 
+    def VBD_insert(self, _1, vbd_ref, vdi_ref):
+        vbd_rec = get_record('VBD', vbd_ref)
+        get_record('VDI', vdi_ref)
+        vbd_rec['empty'] = False
+        vbd_rec['VDI'] = vdi_ref
+
     def VBD_plug(self, _1, ref):
         rec = get_record('VBD', ref)
         if rec['currently_attached']:
@@ -416,7 +432,7 @@ class SessionBase(object):
 
     def VBD_add_to_other_config(self, _1, vbd_ref, key, value):
         db_ref = _db_content['VBD'][vbd_ref]
-        if not 'other_config' in db_ref:
+        if 'other_config' not in db_ref:
             db_ref['other_config'] = {}
         if key in db_ref['other_config']:
             raise Failure(['MAP_DUPLICATE_KEY', 'VBD', 'other_config',
@@ -425,7 +441,7 @@ class SessionBase(object):
 
     def VBD_get_other_config(self, _1, vbd_ref):
         db_ref = _db_content['VBD'][vbd_ref]
-        if not 'other_config' in db_ref:
+        if 'other_config' not in db_ref:
             return {}
         return db_ref['other_config']
 
@@ -463,12 +479,17 @@ class SessionBase(object):
             return ref
         else:
             # SR not found in db, so we create one
-            params = {}
-            params.update(locals())
-            del params['self']
+            params = {'sr_uuid': sr_uuid,
+                      'label': label,
+                      'desc': desc,
+                      'type': type,
+                      'content_type': content_type,
+                      'shared': shared,
+                      'sm_config': sm_config}
             sr_ref = _create_object('SR', params)
             _db_content['SR'][sr_ref]['uuid'] = sr_uuid
             _db_content['SR'][sr_ref]['forgotten'] = 0
+            vdi_per_lun = False
             if type in ('iscsi'):
                 # Just to be clear
                 vdi_per_lun = True
@@ -495,14 +516,14 @@ class SessionBase(object):
 
     def VM_remove_from_xenstore_data(self, _1, vm_ref, key):
         db_ref = _db_content['VM'][vm_ref]
-        if not 'xenstore_data' in db_ref:
+        if 'xenstore_data' not in db_ref:
             return
         if key in db_ref['xenstore_data']:
             del db_ref['xenstore_data'][key]
 
     def VM_add_to_xenstore_data(self, _1, vm_ref, key, value):
         db_ref = _db_content['VM'][vm_ref]
-        if not 'xenstore_data' in db_ref:
+        if 'xenstore_data' not in db_ref:
             db_ref['xenstore_data'] = {}
         db_ref['xenstore_data'][key] = value
 
@@ -511,14 +532,14 @@ class SessionBase(object):
 
     def VDI_remove_from_other_config(self, _1, vdi_ref, key):
         db_ref = _db_content['VDI'][vdi_ref]
-        if not 'other_config' in db_ref:
+        if 'other_config' not in db_ref:
             return
         if key in db_ref['other_config']:
             del db_ref['other_config'][key]
 
     def VDI_add_to_other_config(self, _1, vdi_ref, key, value):
         db_ref = _db_content['VDI'][vdi_ref]
-        if not 'other_config' in db_ref:
+        if 'other_config' not in db_ref:
             db_ref['other_config'] = {}
         if key in db_ref['other_config']:
             raise Failure(['MAP_DUPLICATE_KEY', 'VDI', 'other_config',
@@ -544,7 +565,7 @@ class SessionBase(object):
         return 12 * 1024 * 1024 * 1024
 
     def _plugin_agent_version(self, method, args):
-        return as_json(returncode='0', message='1.0')
+        return as_json(returncode='0', message='1.0\\r\\n')
 
     def _plugin_agent_key_init(self, method, args):
         return as_json(returncode='D0', message='1')
@@ -558,10 +579,24 @@ class SessionBase(object):
     def _plugin_agent_resetnetwork(self, method, args):
         return as_json(returncode='0', message='success')
 
+    def _plugin_agent_agentupdate(self, method, args):
+        url = args["url"]
+        md5 = args["md5sum"]
+        message = "success with %(url)s and hash:%(md5)s" % dict(url=url,
+                                                                 md5=md5)
+        return as_json(returncode='0', message=message)
+
     def _plugin_noop(self, method, args):
         return ''
 
     def _plugin_pickle_noop(self, method, args):
+        return pickle.dumps(None)
+
+    def _plugin_migration_transfer_vhd(self, method, args):
+        kwargs = pickle.loads(args['params'])['kwargs']
+        vdi_ref = self.xenapi_request('VDI.get_by_uuid',
+                (kwargs['vdi_uuid'], ))
+        assert vdi_ref
         return pickle.dumps(None)
 
     _plugin_glance_upload_vhd = _plugin_pickle_noop
@@ -569,13 +604,14 @@ class SessionBase(object):
     _plugin_kernel_create_kernel_ramdisk = _plugin_noop
     _plugin_kernel_remove_kernel_ramdisk = _plugin_noop
     _plugin_migration_move_vhds_into_sr = _plugin_noop
-    _plugin_migration_transfer_vhd = _plugin_pickle_noop
 
     def _plugin_xenhost_host_data(self, method, args):
             return jsonutils.dumps({'host_memory': {'total': 10,
                                                     'overhead': 20,
                                                     'free': 30,
-                                                    'free-computed': 40}})
+                                                    'free-computed': 40},
+                                    'host_hostname': 'fake-xenhost',
+                                    })
 
     def _plugin_poweraction(self, method, args):
         return jsonutils.dumps({"power_action": method[5:]})
@@ -590,6 +626,12 @@ class SessionBase(object):
 
     def _plugin_xenhost_host_uptime(self, method, args):
         return jsonutils.dumps({"uptime": "fake uptime"})
+
+    def _plugin_console_get_console_log(self, method, args):
+        dom_id = args["dom_id"]
+        if dom_id == 0:
+            raise Failure('Guest does not have a console')
+        return base64.b64encode(zlib.compress("dom_id: %s" % dom_id))
 
     def host_call_plugin(self, _1, _2, plugin, method, args):
         func = getattr(self, '_plugin_%s_%s' % (plugin, method), None)
@@ -624,6 +666,14 @@ class SessionBase(object):
         db_ref = _db_content['VM'][vm_ref]
         db_ref['power_state'] = 'Halted'
     VM_clean_shutdown = VM_hard_shutdown
+
+    def VM_suspend(self, session, vm_ref):
+        db_ref = _db_content['VM'][vm_ref]
+        db_ref['power_state'] = 'Suspended'
+
+    def VM_pause(self, session, vm_ref):
+        db_ref = _db_content['VM'][vm_ref]
+        db_ref['power_state'] = 'Paused'
 
     def pool_eject(self, session, host_ref):
         pass
@@ -694,8 +744,8 @@ class SessionBase(object):
             if impl is not None:
 
                 def callit(*params):
-                    localname = name
-                    LOG.debug(_('Calling %(localname)s %(impl)s') % locals())
+                    LOG.debug(_('Calling %(name)s %(impl)s'),
+                              {'name': name, 'impl': impl})
                     self._check_session(params)
                     return impl(*params)
                 return callit
@@ -709,6 +759,8 @@ class SessionBase(object):
             return lambda *params: self._create(name, params)
         elif self._is_destroy(name):
             return lambda *params: self._destroy(name, params)
+        elif name == 'XenAPI':
+            return FakeXenAPI()
         else:
             return None
 
@@ -837,7 +889,7 @@ class SessionBase(object):
                 result = as_value(result)
             task['result'] = result
             task['status'] = 'success'
-        except Failure, exc:
+        except Failure as exc:
             task['error_info'] = exc.details
             task['status'] = 'failed'
         task['finished'] = timeutils.utcnow()
@@ -870,6 +922,11 @@ class SessionBase(object):
                 raise Failure(['UUID_INVALID', v, result, recs, k])
 
         return result
+
+
+class FakeXenAPI(object):
+    def __init__(self):
+        self.Failure = Failure
 
 
 # Based upon _Method from xmlrpclib.

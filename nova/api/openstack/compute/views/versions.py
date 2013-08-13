@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2010-2011 OpenStack LLC.
+# Copyright 2010-2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,10 +19,6 @@ import copy
 import os
 
 from nova.api.openstack import common
-from nova import flags
-
-
-FLAGS = flags.FLAGS
 
 
 def get_view_builder(req):
@@ -92,8 +88,7 @@ class ViewBuilder(common.ViewBuilder):
 
     def generate_href(self, path=None):
         """Create an url that refers to a specific version_number."""
-        prefix = self._update_link_prefix(self.base_url,
-                                          FLAGS.osapi_compute_link_prefix)
+        prefix = self._update_compute_link_prefix(self.base_url)
         version_number = 'v2'
         if path:
             path = path.strip('/')
