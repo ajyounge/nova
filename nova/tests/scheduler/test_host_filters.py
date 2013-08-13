@@ -1,4 +1,4 @@
-# Copyright 2011 OpenStack LLC.  # All Rights Reserved.
+# Copyright 2011 OpenStack Foundation  # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -16,44 +16,23 @@ Tests For Scheduler Host Filters.
 """
 
 import httplib
+
+from oslo.config import cfg
 import stubout
 
 from nova import context
 from nova import db
-from nova import exception
-from nova import flags
 from nova.openstack.common import jsonutils
+from nova.openstack.common import timeutils
 from nova.scheduler import filters
 from nova.scheduler.filters import extra_specs_ops
-from nova.scheduler.filters.trusted_filter import AttestationService
+from nova.scheduler.filters import trusted_filter
+from nova import servicegroup
 from nova import test
 from nova.tests.scheduler import fakes
-from nova import utils
 
-
-DATA = ''
-
-
-def stub_out_https_backend(stubs):
-    """
-    Stubs out the httplib.HTTPRequest.getresponse to return
-    faked-out data instead of grabbing actual contents of a resource
-
-    The stubbed getresponse() returns an iterator over
-    the data "I am a teapot, short and stout\n"
-
-    :param stubs: Set of stubout stubs
-    """
-
-    class FakeHTTPResponse(object):
-
-        def read(self):
-            return DATA
-
-    def fake_do_request(self, *args, **kwargs):
-        return httplib.OK, FakeHTTPResponse()
-
-    stubs.Set(AttestationService, '_do_request', fake_do_request)
+CONF = cfg.CONF
+CONF.import_opt('my_ip', 'nova.netconf')
 
 
 class TestFilter(filters.BaseHostFilter):
@@ -61,11 +40,11 @@ class TestFilter(filters.BaseHostFilter):
 
 
 class TestBogusFilter(object):
-    """Class that doesn't inherit from BaseHostFilter"""
+    """Class that doesn't inherit from BaseHostFilter."""
     pass
 
 
-class ExtraSpecsOpsTestCase(test.TestCase):
+class ExtraSpecsOpsTestCase(test.NoDBTestCase):
     def _do_extra_specs_ops_test(self, value, req, matches):
         assertion = self.assertTrue if matches else self.assertFalse
         assertion(extra_specs_ops.match(value, req))
@@ -251,57 +230,53 @@ class ExtraSpecsOpsTestCase(test.TestCase):
             matches=False)
 
 
-class HostFiltersTestCase(test.TestCase):
+class HostFiltersTestCase(test.NoDBTestCase):
     """Test case for host filters."""
+    # FIXME(sirp): These tests still require DB access until we can separate
+    # the testing of the DB API code from the host-filter code.
+    USES_DB = True
+
+    def fake_oat_request(self, *args, **kwargs):
+        """Stubs out the response from OAT service."""
+        self.oat_attested = True
+        return httplib.OK, self.oat_data
 
     def setUp(self):
         super(HostFiltersTestCase, self).setUp()
+        self.oat_data = ''
+        self.oat_attested = False
         self.stubs = stubout.StubOutForTesting()
-        stub_out_https_backend(self.stubs)
+        self.stubs.Set(trusted_filter.AttestationService, '_request',
+                self.fake_oat_request)
         self.context = context.RequestContext('fake', 'fake')
         self.json_query = jsonutils.dumps(
                 ['and', ['>=', '$free_ram_mb', 1024],
                         ['>=', '$free_disk_mb', 200 * 1024]])
-        # This has a side effect of testing 'get_filter_classes'
-        # when specifying a method (in this case, our standard filters)
-        classes = filters.get_filter_classes(
-                ['nova.scheduler.filters.standard_filters'])
+        filter_handler = filters.HostFilterHandler()
+        classes = filter_handler.get_matching_classes(
+                ['nova.scheduler.filters.all_filters'])
         self.class_map = {}
         for cls in classes:
             self.class_map[cls.__name__] = cls
 
-    def test_get_filter_classes(self):
-        classes = filters.get_filter_classes(
-                ['nova.tests.scheduler.test_host_filters.TestFilter'])
-        self.assertEqual(len(classes), 1)
-        self.assertEqual(classes[0].__name__, 'TestFilter')
-        # Test a specific class along with our standard filters
-        classes = filters.get_filter_classes(
-                ['nova.tests.scheduler.test_host_filters.TestFilter',
-                 'nova.scheduler.filters.standard_filters'])
-        self.assertEqual(len(classes), 1 + len(self.class_map))
-
-    def test_get_filter_classes_raises_on_invalid_classes(self):
-        self.assertRaises(ImportError,
-                filters.get_filter_classes,
-                ['nova.tests.scheduler.test_host_filters.NoExist'])
-        self.assertRaises(exception.ClassNotFound,
-                filters.get_filter_classes,
-                ['nova.tests.scheduler.test_host_filters.TestBogusFilter'])
+    def test_all_filters(self):
+        # Double check at least a couple of known filters exist
+        self.assertIn('AllHostsFilter', self.class_map)
+        self.assertIn('ComputeFilter', self.class_map)
 
     def test_all_host_filter(self):
         filt_cls = self.class_map['AllHostsFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         self.assertTrue(filt_cls.host_passes(host, {}))
 
     def _stub_service_is_up(self, ret_value):
-        def fake_service_is_up(service):
-            return ret_value
-        self.stubs.Set(utils, 'service_is_up', fake_service_is_up)
+        def fake_service_is_up(self, service):
+                return ret_value
+        self.stubs.Set(servicegroup.API, 'service_is_up', fake_service_is_up)
 
     def test_affinity_different_filter_passes(self):
         filt_cls = self.class_map['DifferentHostFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         instance = fakes.FakeInstance(context=self.context,
                                          params={'host': 'host2'})
         instance_uuid = instance.uuid
@@ -314,7 +289,7 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_affinity_different_filter_no_list_passes(self):
         filt_cls = self.class_map['DifferentHostFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         instance = fakes.FakeInstance(context=self.context,
                                          params={'host': 'host2'})
         instance_uuid = instance.uuid
@@ -327,7 +302,7 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_affinity_different_filter_fails(self):
         filt_cls = self.class_map['DifferentHostFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         instance = fakes.FakeInstance(context=self.context,
                                          params={'host': 'host1'})
         instance_uuid = instance.uuid
@@ -340,19 +315,30 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_affinity_different_filter_handles_none(self):
         filt_cls = self.class_map['DifferentHostFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
-        instance = fakes.FakeInstance(context=self.context,
-                                         params={'host': 'host2'})
-        instance_uuid = instance.uuid
+        host = fakes.FakeHostState('host1', 'node1', {})
 
         filter_properties = {'context': self.context.elevated(),
                              'scheduler_hints': None}
 
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
+    def test_affinity_different_filter_handles_deleted_instance(self):
+        filt_cls = self.class_map['DifferentHostFilter']()
+        host = fakes.FakeHostState('host1', 'node1', {})
+        instance = fakes.FakeInstance(context=self.context,
+                                         params={'host': 'host1'})
+        instance_uuid = instance.uuid
+        db.instance_destroy(self.context, instance_uuid)
+
+        filter_properties = {'context': self.context.elevated(),
+                             'scheduler_hints': {
+                                'different_host': [instance_uuid], }}
+
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
     def test_affinity_same_filter_no_list_passes(self):
         filt_cls = self.class_map['SameHostFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         instance = fakes.FakeInstance(context=self.context,
                                          params={'host': 'host1'})
         instance_uuid = instance.uuid
@@ -365,7 +351,7 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_affinity_same_filter_passes(self):
         filt_cls = self.class_map['SameHostFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         instance = fakes.FakeInstance(context=self.context,
                                          params={'host': 'host1'})
         instance_uuid = instance.uuid
@@ -378,7 +364,7 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_affinity_same_filter_fails(self):
         filt_cls = self.class_map['SameHostFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         instance = fakes.FakeInstance(context=self.context,
                                          params={'host': 'host2'})
         instance_uuid = instance.uuid
@@ -391,19 +377,30 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_affinity_same_filter_handles_none(self):
         filt_cls = self.class_map['SameHostFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
-        instance = fakes.FakeInstance(context=self.context,
-                                         params={'host': 'host2'})
-        instance_uuid = instance.uuid
+        host = fakes.FakeHostState('host1', 'node1', {})
 
         filter_properties = {'context': self.context.elevated(),
                              'scheduler_hints': None}
 
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
+    def test_affinity_same_filter_handles_deleted_instance(self):
+        filt_cls = self.class_map['SameHostFilter']()
+        host = fakes.FakeHostState('host1', 'node1', {})
+        instance = fakes.FakeInstance(context=self.context,
+                                         params={'host': 'host1'})
+        instance_uuid = instance.uuid
+        db.instance_destroy(self.context, instance_uuid)
+
+        filter_properties = {'context': self.context.elevated(),
+                             'scheduler_hints': {
+                                'same_host': [instance_uuid], }}
+
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
     def test_affinity_simple_cidr_filter_passes(self):
         filt_cls = self.class_map['SimpleCIDRAffinityFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         host.capabilities = {'host_ip': '10.8.1.1'}
 
         affinity_ip = "10.8.1.100"
@@ -417,7 +414,7 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_affinity_simple_cidr_filter_fails(self):
         filt_cls = self.class_map['SimpleCIDRAffinityFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         host.capabilities = {'host_ip': '10.8.1.1'}
 
         affinity_ip = "10.8.1.100"
@@ -431,9 +428,9 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_affinity_simple_cidr_filter_handles_none(self):
         filt_cls = self.class_map['SimpleCIDRAffinityFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
 
-        affinity_ip = flags.FLAGS.my_ip.split('.')[0:3]
+        affinity_ip = CONF.my_ip.split('.')[0:3]
         affinity_ip.append('100')
         affinity_ip = str.join('.', affinity_ip)
 
@@ -448,7 +445,7 @@ class HostFiltersTestCase(test.TestCase):
         filter_properties = {'instance_type': {'memory_mb': 1024}}
         capabilities = {'enabled': True}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 1024, 'capabilities': capabilities,
                  'service': service})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
@@ -464,7 +461,7 @@ class HostFiltersTestCase(test.TestCase):
 
         capabilities = {'enabled': True}
         service = {'disabled': False}
-        host = fakes.FakeHostState('fake_host', 'compute',
+        host = fakes.FakeHostState('fake_host', 'fake_node',
                 {'capabilities': capabilities,
                  'service': service})
         #True since empty
@@ -490,7 +487,7 @@ class HostFiltersTestCase(test.TestCase):
                              'instance_type': {'name': 'fake2'}}
         capabilities = {'enabled': True}
         service = {'disabled': False}
-        host = fakes.FakeHostState('fake_host', 'compute',
+        host = fakes.FakeHostState('fake_host', 'fake_node',
                 {'capabilities': capabilities,
                  'service': service})
         #True since no aggregates
@@ -509,7 +506,7 @@ class HostFiltersTestCase(test.TestCase):
         filter_properties = {'instance_type': {'memory_mb': 1024}}
         capabilities = {'enabled': True}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 1023, 'total_usable_ram_mb': 1024,
                  'capabilities': capabilities, 'service': service})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
@@ -521,7 +518,7 @@ class HostFiltersTestCase(test.TestCase):
         filter_properties = {'instance_type': {'memory_mb': 1024}}
         capabilities = {'enabled': True}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 1024, 'total_usable_ram_mb': 1024,
                  'capabilities': capabilities, 'service': service})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
@@ -533,11 +530,69 @@ class HostFiltersTestCase(test.TestCase):
         filter_properties = {'instance_type': {'memory_mb': 1024}}
         capabilities = {'enabled': True}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': -1024, 'total_usable_ram_mb': 2048,
                  'capabilities': capabilities, 'service': service})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
         self.assertEqual(2048 * 2.0, host.limits['memory_mb'])
+
+    def test_aggregate_ram_filter_value_error(self):
+        self._stub_service_is_up(True)
+        filt_cls = self.class_map['AggregateRamFilter']()
+        self.flags(ram_allocation_ratio=1.0)
+        filter_properties = {'context': self.context,
+                             'instance_type': {'memory_mb': 1024}}
+        capabilities = {'enabled': True}
+        service = {'disabled': False}
+        host = fakes.FakeHostState('host1', 'node1',
+                {'free_ram_mb': 1024, 'total_usable_ram_mb': 1024,
+                 'capabilities': capabilities, 'service': service})
+        self._create_aggregate_with_host(name='fake_aggregate',
+                hosts=['host1'],
+                metadata={'ram_allocation_ratio': 'XXX'})
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+        self.assertEqual(1024 * 1.0, host.limits['memory_mb'])
+
+    def test_aggregate_ram_filter_default_value(self):
+        self._stub_service_is_up(True)
+        filt_cls = self.class_map['AggregateRamFilter']()
+        self.flags(ram_allocation_ratio=1.0)
+        filter_properties = {'context': self.context,
+                             'instance_type': {'memory_mb': 1024}}
+        capabilities = {'enabled': True}
+        service = {'disabled': False}
+        host = fakes.FakeHostState('host1', 'node1',
+                {'free_ram_mb': 1023, 'total_usable_ram_mb': 1024,
+                 'capabilities': capabilities, 'service': service})
+        # False: fallback to default flag w/o aggregates
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+        self._create_aggregate_with_host(name='fake_aggregate',
+                hosts=['host1'],
+                metadata={'ram_allocation_ratio': '2.0'})
+        # True: use ratio from aggregates
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+        self.assertEqual(1024 * 2.0, host.limits['memory_mb'])
+
+    def test_aggregate_ram_filter_conflict_values(self):
+        self._stub_service_is_up(True)
+        filt_cls = self.class_map['AggregateRamFilter']()
+        self.flags(ram_allocation_ratio=1.0)
+        filter_properties = {'context': self.context,
+                             'instance_type': {'memory_mb': 1024}}
+        capabilities = {'enabled': True}
+        service = {'disabled': False}
+        host = fakes.FakeHostState('host1', 'node1',
+                {'free_ram_mb': 1023, 'total_usable_ram_mb': 1024,
+                 'capabilities': capabilities, 'service': service})
+        self._create_aggregate_with_host(name='fake_aggregate1',
+                hosts=['host1'],
+                metadata={'ram_allocation_ratio': '1.5'})
+        self._create_aggregate_with_host(name='fake_aggregate2',
+                hosts=['host1'],
+                metadata={'ram_allocation_ratio': '2.0'})
+        # use the minimum ratio from aggregates
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+        self.assertEqual(1024 * 1.5, host.limits['memory_mb'])
 
     def test_disk_filter_passes(self):
         self._stub_service_is_up(True)
@@ -547,7 +602,7 @@ class HostFiltersTestCase(test.TestCase):
                                                'ephemeral_gb': 1}}
         capabilities = {'enabled': True}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_disk_mb': 11 * 1024, 'total_usable_disk_gb': 13,
                  'capabilities': capabilities, 'service': service})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
@@ -556,14 +611,14 @@ class HostFiltersTestCase(test.TestCase):
         self._stub_service_is_up(True)
         filt_cls = self.class_map['DiskFilter']()
         self.flags(disk_allocation_ratio=1.0)
-        filter_properties = {'instance_type': {'root_gb': 2,
+        filter_properties = {'instance_type': {'root_gb': 11,
                                                'ephemeral_gb': 1}}
         capabilities = {'enabled': True}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_disk_mb': 11 * 1024, 'total_usable_disk_gb': 13,
                  'capabilities': capabilities, 'service': service})
-        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
     def test_disk_filter_oversubscribe(self):
         self._stub_service_is_up(True)
@@ -574,7 +629,7 @@ class HostFiltersTestCase(test.TestCase):
         capabilities = {'enabled': True}
         service = {'disabled': False}
         # 1GB used... so 119GB allowed...
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_disk_mb': 11 * 1024, 'total_usable_disk_gb': 12,
                  'capabilities': capabilities, 'service': service})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
@@ -589,7 +644,7 @@ class HostFiltersTestCase(test.TestCase):
         capabilities = {'enabled': True}
         service = {'disabled': False}
         # 1GB used... so 119GB allowed...
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_disk_mb': 11 * 1024, 'total_usable_disk_gb': 12,
                  'capabilities': capabilities, 'service': service})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
@@ -600,7 +655,7 @@ class HostFiltersTestCase(test.TestCase):
         filter_properties = {'instance_type': {'memory_mb': 1024}}
         capabilities = {'enabled': True}
         service = {'disabled': True}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 1024, 'capabilities': capabilities,
                  'service': service})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
@@ -611,7 +666,7 @@ class HostFiltersTestCase(test.TestCase):
         filter_properties = {'instance_type': {'memory_mb': 1024}}
         capabilities = {'enabled': True}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 1024, 'capabilities': capabilities,
                  'service': service})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
@@ -622,32 +677,10 @@ class HostFiltersTestCase(test.TestCase):
         filter_properties = {'instance_type': {'memory_mb': 1024}}
         capabilities = {'enabled': False}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 1024, 'capabilities': capabilities,
                  'service': service})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
-
-    def test_compute_filter_passes_on_volume(self):
-        self._stub_service_is_up(True)
-        filt_cls = self.class_map['ComputeFilter']()
-        filter_properties = {'instance_type': {'memory_mb': 1024}}
-        capabilities = {'enabled': False}
-        service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'volume',
-                {'free_ram_mb': 1024, 'capabilities': capabilities,
-                 'service': service})
-        self.assertTrue(filt_cls.host_passes(host, filter_properties))
-
-    def test_compute_filter_passes_on_no_instance_type(self):
-        self._stub_service_is_up(True)
-        filt_cls = self.class_map['ComputeFilter']()
-        filter_properties = {}
-        capabilities = {'enabled': False}
-        service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
-                {'free_ram_mb': 1024, 'capabilities': capabilities,
-                 'service': service})
-        self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
     def test_image_properties_filter_passes_same_inst_props(self):
         self._stub_service_is_up(True)
@@ -659,7 +692,7 @@ class HostFiltersTestCase(test.TestCase):
         capabilities = {'enabled': True,
                             'supported_instances': [
                                 ('x86_64', 'kvm', 'hvm')]}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'capabilities': capabilities})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
@@ -673,7 +706,7 @@ class HostFiltersTestCase(test.TestCase):
         capabilities = {'enabled': True,
                             'supported_instances': [
                                 ('x86_64', 'kvm', 'hvm')]}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'capabilities': capabilities})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
@@ -686,7 +719,7 @@ class HostFiltersTestCase(test.TestCase):
         capabilities = {'enabled': True,
                             'supported_instances': [
                                 ('x86_64', 'kvm', 'hvm')]}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'capabilities': capabilities})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
@@ -699,7 +732,7 @@ class HostFiltersTestCase(test.TestCase):
         capabilities = {'enabled': True,
                             'supported_instances': [
                                 ('x86_64', 'xen', 'xen')]}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'capabilities': capabilities})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
@@ -710,7 +743,7 @@ class HostFiltersTestCase(test.TestCase):
         capabilities = {'enabled': True,
                             'supported_instances': [
                                 ('x86_64', 'kvm', 'hvm')]}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'capabilities': capabilities})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
@@ -722,11 +755,14 @@ class HostFiltersTestCase(test.TestCase):
                                     'vm_mode': 'hvm'}}
         filter_properties = {'request_spec': {'image': img_props}}
         capabilities = {'enabled': True}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'capabilities': capabilities})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
     def _do_test_compute_filter_extra_specs(self, ecaps, especs, passes):
+        """In real Openstack runtime environment,compute capabilities
+        value may be number, so we should use number to do unit test.
+        """
         self._stub_service_is_up(True)
         filt_cls = self.class_map['ComputeCapabilitiesFilter']()
         capabilities = {'enabled': True}
@@ -734,7 +770,7 @@ class HostFiltersTestCase(test.TestCase):
         service = {'disabled': False}
         filter_properties = {'instance_type': {'memory_mb': 1024,
                                                'extra_specs': especs}}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 1024, 'capabilities': capabilities,
                  'service': service})
         assertion = self.assertTrue if passes else self.assertFalse
@@ -742,15 +778,36 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_compute_filter_passes_extra_specs_simple(self):
         self._do_test_compute_filter_extra_specs(
-            ecaps={'opt1': '1', 'opt2': '2'},
+            ecaps={'opt1': 1, 'opt2': 2},
             especs={'opt1': '1', 'opt2': '2', 'trust:trusted_host': 'true'},
             passes=True)
 
     def test_compute_filter_fails_extra_specs_simple(self):
         self._do_test_compute_filter_extra_specs(
-            ecaps={'opt1': '1', 'opt2': '2'},
+            ecaps={'opt1': 1, 'opt2': 2},
             especs={'opt1': '1', 'opt2': '222', 'trust:trusted_host': 'true'},
             passes=False)
+
+    def test_compute_filter_pass_extra_specs_simple_with_scope(self):
+        self._do_test_compute_filter_extra_specs(
+            ecaps={'opt1': 1, 'opt2': 2},
+            especs={'capabilities:opt1': '1',
+                    'trust:trusted_host': 'true'},
+            passes=True)
+
+    def test_compute_filter_extra_specs_simple_with_wrong_scope(self):
+        self._do_test_compute_filter_extra_specs(
+            ecaps={'opt1': 1, 'opt2': 2},
+            especs={'wrong_scope:opt1': '1',
+                    'trust:trusted_host': 'true'},
+            passes=True)
+
+    def test_compute_filter_extra_specs_pass_multi_level_with_scope(self):
+        self._do_test_compute_filter_extra_specs(
+            ecaps={'opt1': {'a': 1, 'b': {'aa': 2}}, 'opt2': 2},
+            especs={'opt1:a': '1', 'capabilities:opt1:b:aa': '2',
+                    'trust:trusted_host': 'true'},
+            passes=True)
 
     def test_aggregate_filter_passes_no_extra_specs(self):
         self._stub_service_is_up(True)
@@ -759,18 +816,21 @@ class HostFiltersTestCase(test.TestCase):
 
         filter_properties = {'context': self.context, 'instance_type':
                 {'memory_mb': 1024}}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'capabilities': capabilities})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
     def _create_aggregate_with_host(self, name='fake_aggregate',
                           metadata=None,
                           hosts=['host1']):
-        values = {'name': name,
-                    'availability_zone': 'fake_avail_zone', }
+        values = {'name': name}
+        if metadata:
+            metadata['availability_zone'] = 'fake_avail_zone'
+        else:
+            metadata = {'availability_zone': 'fake_avail_zone'}
         result = db.aggregate_create(self.context.elevated(), values, metadata)
         for host in hosts:
-            db.aggregate_host_add(self.context.elevated(), result.id, host)
+            db.aggregate_host_add(self.context.elevated(), result['id'], host)
         return result
 
     def _do_test_aggregate_filter_extra_specs(self, emeta, especs, passes):
@@ -779,7 +839,8 @@ class HostFiltersTestCase(test.TestCase):
         self._create_aggregate_with_host(name='fake2', metadata=emeta)
         filter_properties = {'context': self.context,
             'instance_type': {'memory_mb': 1024, 'extra_specs': especs}}
-        host = fakes.FakeHostState('host1', 'compute', {'free_ram_mb': 1024})
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'free_ram_mb': 1024})
         assertion = self.assertTrue if passes else self.assertFalse
         assertion(filt_cls.host_passes(host, filter_properties))
 
@@ -793,8 +854,9 @@ class HostFiltersTestCase(test.TestCase):
                 metadata={'opt2': '2'})
         filter_properties = {'context': self.context, 'instance_type':
                 {'memory_mb': 1024, 'extra_specs': extra_specs}}
-        host = fakes.FakeHostState('host1', 'compute', {'free_ram_mb': 1024})
-        db.aggregate_host_delete(self.context.elevated(), agg2.id, 'host1')
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'free_ram_mb': 1024})
+        db.aggregate_host_delete(self.context.elevated(), agg2['id'], 'host1')
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
     def test_aggregate_filter_passes_extra_specs_simple(self):
@@ -811,49 +873,59 @@ class HostFiltersTestCase(test.TestCase):
                     'trust:trusted_host': 'true'},
             passes=False)
 
-    def test_isolated_hosts_fails_isolated_on_non_isolated(self):
-        self.flags(isolated_images=['isolated'], isolated_hosts=['isolated'])
-        filt_cls = self.class_map['IsolatedHostsFilter']()
+    def _do_test_isolated_hosts(self, host_in_list, image_in_list,
+                                set_flags=True):
+        if set_flags:
+            self.flags(isolated_images=['isolated_image'],
+                       isolated_hosts=['isolated_host'])
+        host_name = 'isolated_host' if host_in_list else 'free_host'
+        image_ref = 'isolated_image' if image_in_list else 'free_image'
         filter_properties = {
             'request_spec': {
-                'instance_properties': {'image_ref': 'isolated'}
+                'instance_properties': {'image_ref': image_ref}
             }
         }
-        host = fakes.FakeHostState('non-isolated', 'compute', {})
-        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+        filt_cls = self.class_map['IsolatedHostsFilter']()
+        host = fakes.FakeHostState(host_name, 'node', {})
+        return filt_cls.host_passes(host, filter_properties)
+
+    def test_isolated_hosts_fails_isolated_on_non_isolated(self):
+        self.assertFalse(self._do_test_isolated_hosts(False, True))
 
     def test_isolated_hosts_fails_non_isolated_on_isolated(self):
-        self.flags(isolated_images=['isolated'], isolated_hosts=['isolated'])
-        filt_cls = self.class_map['IsolatedHostsFilter']()
-        filter_properties = {
-            'request_spec': {
-                'instance_properties': {'image_ref': 'non-isolated'}
-            }
-        }
-        host = fakes.FakeHostState('isolated', 'compute', {})
-        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+        self.assertFalse(self._do_test_isolated_hosts(True, False))
 
     def test_isolated_hosts_passes_isolated_on_isolated(self):
-        self.flags(isolated_images=['isolated'], isolated_hosts=['isolated'])
-        filt_cls = self.class_map['IsolatedHostsFilter']()
-        filter_properties = {
-            'request_spec': {
-                'instance_properties': {'image_ref': 'isolated'}
-            }
-        }
-        host = fakes.FakeHostState('isolated', 'compute', {})
-        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+        self.assertTrue(self._do_test_isolated_hosts(True, True))
 
     def test_isolated_hosts_passes_non_isolated_on_non_isolated(self):
-        self.flags(isolated_images=['isolated'], isolated_hosts=['isolated'])
-        filt_cls = self.class_map['IsolatedHostsFilter']()
-        filter_properties = {
-            'request_spec': {
-                'instance_properties': {'image_ref': 'non-isolated'}
-            }
-        }
-        host = fakes.FakeHostState('non-isolated', 'compute', {})
-        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+        self.assertTrue(self._do_test_isolated_hosts(False, False))
+
+    def test_isolated_hosts_no_config(self):
+        # If there are no hosts nor isolated images in the config, it should
+        # not filter at all. This is the default config.
+        self.assertTrue(self._do_test_isolated_hosts(False, True, False))
+        self.assertTrue(self._do_test_isolated_hosts(True, False, False))
+        self.assertTrue(self._do_test_isolated_hosts(True, True, False))
+        self.assertTrue(self._do_test_isolated_hosts(False, False, False))
+
+    def test_isolated_hosts_no_hosts_config(self):
+        self.flags(isolated_images=['isolated_image'])
+        # If there are no hosts in the config, it should only filter out
+        # images that are listed
+        self.assertFalse(self._do_test_isolated_hosts(False, True, False))
+        self.assertTrue(self._do_test_isolated_hosts(True, False, False))
+        self.assertFalse(self._do_test_isolated_hosts(True, True, False))
+        self.assertTrue(self._do_test_isolated_hosts(False, False, False))
+
+    def test_isolated_hosts_no_images_config(self):
+        self.flags(isolated_hosts=['isolated_host'])
+        # If there are no images in the config, it should only filter out
+        # isolated_hosts
+        self.assertTrue(self._do_test_isolated_hosts(False, True, False))
+        self.assertFalse(self._do_test_isolated_hosts(True, False, False))
+        self.assertFalse(self._do_test_isolated_hosts(True, True, False))
+        self.assertTrue(self._do_test_isolated_hosts(False, False, False))
 
     def test_json_filter_passes(self):
         filt_cls = self.class_map['JsonFilter']()
@@ -862,7 +934,7 @@ class HostFiltersTestCase(test.TestCase):
                                                'ephemeral_gb': 0},
                            'scheduler_hints': {'query': self.json_query}}
         capabilities = {'enabled': True}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 1024,
                  'free_disk_mb': 200 * 1024,
                  'capabilities': capabilities})
@@ -874,7 +946,7 @@ class HostFiltersTestCase(test.TestCase):
                                                'root_gb': 200,
                                                'ephemeral_gb': 0}}
         capabilities = {'enabled': True}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 0,
                  'free_disk_mb': 0,
                  'capabilities': capabilities})
@@ -887,7 +959,7 @@ class HostFiltersTestCase(test.TestCase):
                                                'ephemeral_gb': 0},
                            'scheduler_hints': {'query': self.json_query}}
         capabilities = {'enabled': True}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 1023,
                  'free_disk_mb': 200 * 1024,
                  'capabilities': capabilities})
@@ -900,7 +972,7 @@ class HostFiltersTestCase(test.TestCase):
                                                'ephemeral_gb': 0},
                            'scheduler_hints': {'query': self.json_query}}
         capabilities = {'enabled': True}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 1024,
                  'free_disk_mb': (200 * 1024) - 1,
                  'capabilities': capabilities})
@@ -917,7 +989,7 @@ class HostFiltersTestCase(test.TestCase):
                                                'ephemeral_gb': 0},
                            'scheduler_hints': {'query': json_query}}
         capabilities = {'enabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 1024,
                  'free_disk_mb': 200 * 1024,
                  'capabilities': capabilities})
@@ -933,15 +1005,14 @@ class HostFiltersTestCase(test.TestCase):
                                                'local_gb': 200},
                            'scheduler_hints': {'query': json_query}}
         capabilities = {'enabled': True}
-        service = {'disabled': True}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 1024,
                  'free_disk_mb': 200 * 1024,
                  'capabilities': capabilities})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
     def test_json_filter_happy_day(self):
-        """Test json filter more thoroughly"""
+        # Test json filter more thoroughly.
         filt_cls = self.class_map['JsonFilter']()
         raw = ['and',
                   '$capabilities.enabled',
@@ -962,7 +1033,7 @@ class HostFiltersTestCase(test.TestCase):
         # Passes
         capabilities = {'enabled': True, 'opt1': 'match'}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 10,
                  'free_disk_mb': 200,
                  'capabilities': capabilities,
@@ -972,7 +1043,7 @@ class HostFiltersTestCase(test.TestCase):
         # Passes
         capabilities = {'enabled': True, 'opt1': 'match'}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 40,
                  'free_disk_mb': 400,
                  'capabilities': capabilities,
@@ -982,7 +1053,7 @@ class HostFiltersTestCase(test.TestCase):
         # Fails due to capabilities being disabled
         capabilities = {'enabled': False, 'opt1': 'match'}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'instance_type',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 40,
                  'free_disk_mb': 400,
                  'capabilities': capabilities,
@@ -992,7 +1063,7 @@ class HostFiltersTestCase(test.TestCase):
         # Fails due to being exact memory/disk we don't want
         capabilities = {'enabled': True, 'opt1': 'match'}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 30,
                  'free_disk_mb': 300,
                  'capabilities': capabilities,
@@ -1002,7 +1073,7 @@ class HostFiltersTestCase(test.TestCase):
         # Fails due to memory lower but disk higher
         capabilities = {'enabled': True, 'opt1': 'match'}
         service = {'disabled': False}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 20,
                  'free_disk_mb': 400,
                  'capabilities': capabilities,
@@ -1012,7 +1083,7 @@ class HostFiltersTestCase(test.TestCase):
         # Fails due to capabilities 'opt1' not equal
         capabilities = {'enabled': True, 'opt1': 'no-match'}
         service = {'enabled': True}
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'free_ram_mb': 20,
                  'free_disk_mb': 400,
                  'capabilities': capabilities,
@@ -1021,7 +1092,7 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_json_filter_basic_operators(self):
         filt_cls = self.class_map['JsonFilter']()
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'capabilities': {'enabled': True}})
         # (operator, arguments, expected_result)
         ops_to_test = [
@@ -1090,14 +1161,14 @@ class HostFiltersTestCase(test.TestCase):
                 'query': jsonutils.dumps(raw),
             },
         }
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'capabilities': {'enabled': True}})
         self.assertRaises(KeyError,
                 filt_cls.host_passes, host, filter_properties)
 
     def test_json_filter_empty_filters_pass(self):
         filt_cls = self.class_map['JsonFilter']()
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'capabilities': {'enabled': True}})
 
         raw = []
@@ -1117,7 +1188,7 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_json_filter_invalid_num_arguments_fails(self):
         filt_cls = self.class_map['JsonFilter']()
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'capabilities': {'enabled': True}})
 
         raw = ['>', ['and', ['or', ['not', ['<', ['>=', ['<=', ['in', ]]]]]]]]
@@ -1138,7 +1209,7 @@ class HostFiltersTestCase(test.TestCase):
 
     def test_json_filter_unknown_variable_ignored(self):
         filt_cls = self.class_map['JsonFilter']()
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'capabilities': {'enabled': True}})
 
         raw = ['=', '$........', 1, 1]
@@ -1160,74 +1231,235 @@ class HostFiltersTestCase(test.TestCase):
     def test_trusted_filter_default_passes(self):
         self._stub_service_is_up(True)
         filt_cls = self.class_map['TrustedFilter']()
-        filter_properties = {'instance_type': {'memory_mb': 1024}}
-        host = fakes.FakeHostState('host1', 'compute', {})
+        filter_properties = {'context': self.context.elevated(),
+                             'instance_type': {'memory_mb': 1024}}
+        host = fakes.FakeHostState('host1', 'node1', {})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
     def test_trusted_filter_trusted_and_trusted_passes(self):
-        global DATA
-        DATA = '{"hosts":[{"host_name":"host1","trust_lvl":"trusted"}]}'
+        self.oat_data = {"hosts": [{"host_name": "host1",
+                                   "trust_lvl": "trusted",
+                                   "vtime": timeutils.isotime()}]}
         self._stub_service_is_up(True)
         filt_cls = self.class_map['TrustedFilter']()
         extra_specs = {'trust:trusted_host': 'trusted'}
-        filter_properties = {'instance_type': {'memory_mb': 1024,
+        filter_properties = {'context': self.context.elevated(),
+                             'instance_type': {'memory_mb': 1024,
                                                'extra_specs': extra_specs}}
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
     def test_trusted_filter_trusted_and_untrusted_fails(self):
-        global DATA
-        DATA = '{"hosts":[{"host_name":"host1","trust_lvl":"untrusted"}]}'
+        self.oat_data = {"hosts": [{"host_name": "host1",
+                                    "trust_lvl": "untrusted",
+                                    "vtime": timeutils.isotime()}]}
         self._stub_service_is_up(True)
         filt_cls = self.class_map['TrustedFilter']()
         extra_specs = {'trust:trusted_host': 'trusted'}
-        filter_properties = {'instance_type': {'memory_mb': 1024,
+        filter_properties = {'context': self.context.elevated(),
+                             'instance_type': {'memory_mb': 1024,
                                                'extra_specs': extra_specs}}
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
     def test_trusted_filter_untrusted_and_trusted_fails(self):
-        global DATA
-        DATA = '{"hosts":[{"host_name":"host1","trust_lvl":"trusted"}]}'
+        self.oat_data = {"hosts": [{"host_name": "host1",
+                                    "trust_lvl": "trusted",
+                                    "vtime": timeutils.isotime()}]}
         self._stub_service_is_up(True)
         filt_cls = self.class_map['TrustedFilter']()
         extra_specs = {'trust:trusted_host': 'untrusted'}
-        filter_properties = {'instance_type': {'memory_mb': 1024,
+        filter_properties = {'context': self.context.elevated(),
+                             'instance_type': {'memory_mb': 1024,
                                                'extra_specs': extra_specs}}
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
     def test_trusted_filter_untrusted_and_untrusted_passes(self):
-        global DATA
-        DATA = '{"hosts":[{"host_name":"host1","trust_lvl":"untrusted"}]}'
+        self.oat_data = {"hosts": [{"host_name": "host1",
+                                    "trust_lvl": "untrusted",
+                                    "vtime": timeutils.isotime()}]}
         self._stub_service_is_up(True)
         filt_cls = self.class_map['TrustedFilter']()
         extra_specs = {'trust:trusted_host': 'untrusted'}
-        filter_properties = {'instance_type': {'memory_mb': 1024,
+        filter_properties = {'context': self.context.elevated(),
+                             'instance_type': {'memory_mb': 1024,
                                                'extra_specs': extra_specs}}
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
+    def test_trusted_filter_update_cache(self):
+        self.oat_data = {"hosts": [{"host_name":
+                                    "host1", "trust_lvl": "untrusted",
+                                    "vtime": timeutils.isotime()}]}
+
+        filt_cls = self.class_map['TrustedFilter']()
+        extra_specs = {'trust:trusted_host': 'untrusted'}
+        filter_properties = {'context': self.context.elevated(),
+                             'instance_type': {'memory_mb': 1024,
+                                               'extra_specs': extra_specs}}
+        host = fakes.FakeHostState('host1', 'node1', {})
+
+        filt_cls.host_passes(host, filter_properties)     # Fill the caches
+
+        self.oat_attested = False
+        filt_cls.host_passes(host, filter_properties)
+        self.assertFalse(self.oat_attested)
+
+        self.oat_attested = False
+
+        timeutils.set_time_override(timeutils.utcnow())
+        timeutils.advance_time_seconds(
+            CONF.trusted_computing.attestation_auth_timeout + 80)
+        filt_cls.host_passes(host, filter_properties)
+        self.assertTrue(self.oat_attested)
+
+        timeutils.clear_time_override()
+
+    def test_trusted_filter_update_cache_timezone(self):
+        self.oat_data = {"hosts": [{"host_name": "host1",
+                                    "trust_lvl": "untrusted",
+                                    "vtime": "2012-09-09T05:10:40-04:00"}]}
+
+        filt_cls = self.class_map['TrustedFilter']()
+        extra_specs = {'trust:trusted_host': 'untrusted'}
+        filter_properties = {'context': self.context.elevated(),
+                             'instance_type': {'memory_mb': 1024,
+                                               'extra_specs': extra_specs}}
+        host = fakes.FakeHostState('host1', 'node1', {})
+
+        timeutils.set_time_override(
+            timeutils.normalize_time(
+                timeutils.parse_isotime("2012-09-09T09:10:40Z")))
+
+        filt_cls.host_passes(host, filter_properties)     # Fill the caches
+
+        self.oat_attested = False
+        filt_cls.host_passes(host, filter_properties)
+        self.assertFalse(self.oat_attested)
+
+        self.oat_attested = False
+        timeutils.advance_time_seconds(
+            CONF.trusted_computing.attestation_auth_timeout - 10)
+        filt_cls.host_passes(host, filter_properties)
+        self.assertFalse(self.oat_attested)
+
+        timeutils.clear_time_override()
 
     def test_core_filter_passes(self):
         filt_cls = self.class_map['CoreFilter']()
         filter_properties = {'instance_type': {'vcpus': 1}}
         self.flags(cpu_allocation_ratio=2)
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'vcpus_total': 4, 'vcpus_used': 7})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
     def test_core_filter_fails_safe(self):
         filt_cls = self.class_map['CoreFilter']()
         filter_properties = {'instance_type': {'vcpus': 1}}
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
     def test_core_filter_fails(self):
         filt_cls = self.class_map['CoreFilter']()
         filter_properties = {'instance_type': {'vcpus': 1}}
         self.flags(cpu_allocation_ratio=2)
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                 {'vcpus_total': 4, 'vcpus_used': 8})
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
+    def test_aggregate_core_filter_value_error(self):
+        filt_cls = self.class_map['AggregateCoreFilter']()
+        filter_properties = {'context': self.context,
+                             'instance_type': {'vcpus': 1}}
+        self.flags(cpu_allocation_ratio=2)
+        host = fakes.FakeHostState('host1', 'node1',
+                {'vcpus_total': 4, 'vcpus_used': 7})
+        self._create_aggregate_with_host(name='fake_aggregate',
+                hosts=['host1'],
+                metadata={'cpu_allocation_ratio': 'XXX'})
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+        self.assertEqual(4 * 2, host.limits['vcpu'])
+
+    def test_aggregate_core_filter_default_value(self):
+        filt_cls = self.class_map['AggregateCoreFilter']()
+        filter_properties = {'context': self.context,
+                             'instance_type': {'vcpus': 1}}
+        self.flags(cpu_allocation_ratio=2)
+        host = fakes.FakeHostState('host1', 'node1',
+                {'vcpus_total': 4, 'vcpus_used': 8})
+        # False: fallback to default flag w/o aggregates
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+        self._create_aggregate_with_host(name='fake_aggregate',
+                hosts=['host1'],
+                metadata={'cpu_allocation_ratio': '3'})
+        # True: use ratio from aggregates
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+        self.assertEqual(4 * 3, host.limits['vcpu'])
+
+    def test_aggregate_core_filter_conflict_values(self):
+        filt_cls = self.class_map['AggregateCoreFilter']()
+        filter_properties = {'context': self.context,
+                             'instance_type': {'vcpus': 1}}
+        self.flags(cpu_allocation_ratio=1)
+        host = fakes.FakeHostState('host1', 'node1',
+                {'vcpus_total': 4, 'vcpus_used': 8})
+        self._create_aggregate_with_host(name='fake_aggregate1',
+                hosts=['host1'],
+                metadata={'cpu_allocation_ratio': '2'})
+        self._create_aggregate_with_host(name='fake_aggregate2',
+                hosts=['host1'],
+                metadata={'cpu_allocation_ratio': '3'})
+        # use the minimum ratio from aggregates
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+        self.assertEqual(4 * 2, host.limits['vcpu'])
+
+    def test_pci_passthrough_filter_single_label_passes(self):
+        filt_cls = self.class_map['PciPassthroughFilter']()
+        specs = {'pci_passthrough:labels': '["lab1"]'}
+        filter_properties = {'instance_type': {'extra_specs': specs}}
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'free_pci_labels': ['lab1']})
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
+    def test_pci_passthrough_filter_multi_label_passes(self):
+        filt_cls = self.class_map['PciPassthroughFilter']()
+        specs = {'pci_passthrough:labels': '["lab1", "lab2"]'}
+        filter_properties = {'instance_type': {'extra_specs': specs}}
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'free_pci_labels': ['lab1', 'lab2']})
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
+    def test_pci_passthrough_filter_single_label_fails(self):
+        filt_cls = self.class_map['PciPassthroughFilter']()
+        specs = {'pci_passthrough:labels': '["lab1"]'}
+        filter_properties = {'instance_type': {'extra_specs': specs}}
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'free_pci_labels': []})
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
+    def test_pci_passthrough_filter_multi_label_fails(self):
+        filt_cls = self.class_map['PciPassthroughFilter']()
+        specs = {'pci_passthrough:labels': '["lab1", "lab3"]'}
+        filter_properties = {'instance_type': {'extra_specs': specs}}
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'free_pci_labels': ['lab1', 'lab2']})
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
+    def test_pci_passthrough_filter_multi_same_label_passes(self):
+        filt_cls = self.class_map['PciPassthroughFilter']()
+        specs = {'pci_passthrough:labels': '["lab3", "lab3"]'}
+        filter_properties = {'instance_type': {'extra_specs': specs}}
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'free_pci_labels': ["l", 'lab3', "lab3"]})
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
+    def test_pci_passthrough_filter_multi_same_label_fails(self):
+        filt_cls = self.class_map['PciPassthroughFilter']()
+        specs = {'pci_passthrough:labels': '["lab1", "lab3", "lab3"]'}
+        filter_properties = {'instance_type': {'extra_specs': specs}}
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'free_pci_labels': ['lab1', 'lab3']})
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
     @staticmethod
@@ -1246,43 +1478,49 @@ class HostFiltersTestCase(test.TestCase):
         filt_cls = self.class_map['AvailabilityZoneFilter']()
         service = {'availability_zone': 'nova'}
         request = self._make_zone_request('nova')
-        host = fakes.FakeHostState('host1', 'compute', {'service': service})
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'service': service})
         self.assertTrue(filt_cls.host_passes(host, request))
 
     def test_availability_zone_filter_different(self):
         filt_cls = self.class_map['AvailabilityZoneFilter']()
         service = {'availability_zone': 'nova'}
         request = self._make_zone_request('bad')
-        host = fakes.FakeHostState('host1', 'compute', {'service': service})
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'service': service})
         self.assertFalse(filt_cls.host_passes(host, request))
 
     def test_retry_filter_disabled(self):
-        """Test case where retry/re-scheduling is disabled"""
+        # Test case where retry/re-scheduling is disabled.
         filt_cls = self.class_map['RetryFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
+        host = fakes.FakeHostState('host1', 'node1', {})
         filter_properties = {}
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
     def test_retry_filter_pass(self):
-        """Host not previously tried"""
+        # Node not previously tried.
         filt_cls = self.class_map['RetryFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
-        retry = dict(num_attempts=1, hosts=['host2', 'host3'])
+        host = fakes.FakeHostState('host1', 'nodeX', {})
+        retry = dict(num_attempts=2,
+                     hosts=[['host1', 'node1'],  # same host, different node
+                            ['host2', 'node2'],  # different host and node
+                            ])
         filter_properties = dict(retry=retry)
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
 
     def test_retry_filter_fail(self):
-        """Host was already tried"""
+        # Node was already tried.
         filt_cls = self.class_map['RetryFilter']()
-        host = fakes.FakeHostState('host1', 'compute', {})
-        retry = dict(num_attempts=1, hosts=['host3', 'host1'])
+        host = fakes.FakeHostState('host1', 'node1', {})
+        retry = dict(num_attempts=1,
+                     hosts=[['host1', 'node1']])
         filter_properties = dict(retry=retry)
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
 
     def test_filter_num_iops_passes(self):
         self.flags(max_io_ops_per_host=8)
         filt_cls = self.class_map['IoOpsFilter']()
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                                    {'num_io_ops': 7})
         filter_properties = {}
         self.assertTrue(filt_cls.host_passes(host, filter_properties))
@@ -1290,7 +1528,76 @@ class HostFiltersTestCase(test.TestCase):
     def test_filter_num_iops_fails(self):
         self.flags(max_io_ops_per_host=8)
         filt_cls = self.class_map['IoOpsFilter']()
-        host = fakes.FakeHostState('host1', 'compute',
+        host = fakes.FakeHostState('host1', 'node1',
                                    {'num_io_ops': 8})
         filter_properties = {}
         self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
+    def test_filter_num_instances_passes(self):
+        self.flags(max_instances_per_host=5)
+        filt_cls = self.class_map['NumInstancesFilter']()
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'num_instances': 4})
+        filter_properties = {}
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
+    def test_filter_num_instances_fails(self):
+        self.flags(max_instances_per_host=5)
+        filt_cls = self.class_map['NumInstancesFilter']()
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'num_instances': 5})
+        filter_properties = {}
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
+    def test_group_anti_affinity_filter_passes(self):
+        filt_cls = self.class_map['GroupAntiAffinityFilter']()
+        host = fakes.FakeHostState('host1', 'node1', {})
+        filter_properties = {'group_hosts': []}
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+        filter_properties = {'group_hosts': ['host2']}
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
+    def test_group_anti_affinity_filter_fails(self):
+        filt_cls = self.class_map['GroupAntiAffinityFilter']()
+        host = fakes.FakeHostState('host1', 'node1', {})
+        filter_properties = {'group_hosts': ['host1']}
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
+    def test_aggregate_multi_tenancy_isolation_with_meta_passes(self):
+        self._stub_service_is_up(True)
+        filt_cls = self.class_map['AggregateMultiTenancyIsolation']()
+        aggr_meta = {'filter_tenant_id': 'my_tenantid'}
+        self._create_aggregate_with_host(name='fake1', metadata=aggr_meta,
+                                         hosts=['host1'])
+        filter_properties = {'context': self.context,
+                             'request_spec': {
+                                 'instance_properties': {
+                                     'project_id': 'my_tenantid'}}}
+        host = fakes.FakeHostState('host1', 'compute', {})
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))
+
+    def test_aggregate_multi_tenancy_isolation_fails(self):
+        self._stub_service_is_up(True)
+        filt_cls = self.class_map['AggregateMultiTenancyIsolation']()
+        aggr_meta = {'filter_tenant_id': 'other_tenantid'}
+        self._create_aggregate_with_host(name='fake1', metadata=aggr_meta,
+                                         hosts=['host1'])
+        filter_properties = {'context': self.context,
+                             'request_spec': {
+                                 'instance_properties': {
+                                     'project_id': 'my_tenantid'}}}
+        host = fakes.FakeHostState('host1', 'compute', {})
+        self.assertFalse(filt_cls.host_passes(host, filter_properties))
+
+    def test_aggregate_multi_tenancy_isolation_no_meta_passes(self):
+        self._stub_service_is_up(True)
+        filt_cls = self.class_map['AggregateMultiTenancyIsolation']()
+        aggr_meta = {}
+        self._create_aggregate_with_host(name='fake1', metadata=aggr_meta,
+                                         hosts=['host1'])
+        filter_properties = {'context': self.context,
+                             'request_spec': {
+                                 'instance_properties': {
+                                     'project_id': 'my_tenantid'}}}
+        host = fakes.FakeHostState('host1', 'compute', {})
+        self.assertTrue(filt_cls.host_passes(host, filter_properties))

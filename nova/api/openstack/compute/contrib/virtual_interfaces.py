@@ -21,10 +21,8 @@ from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import compute
 from nova import network
-from nova.openstack.common import log as logging
 
 
-LOG = logging.getLogger(__name__)
 authorize = extensions.extension_authorizer('compute', 'virtual_interfaces')
 
 
@@ -77,7 +75,7 @@ class ServerVirtualInterfaceController(object):
 
 
 class Virtual_interfaces(extensions.ExtensionDescriptor):
-    """Virtual interface support"""
+    """Virtual interface support."""
 
     name = "VirtualInterfaces"
     alias = "os-virtual-interfaces"

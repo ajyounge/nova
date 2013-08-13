@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2012 OpenStack, LLC.
+# Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -19,13 +19,15 @@
 the system.
 """
 
+from oslo.config import cfg
+
+from nova.compute import flavors
 import nova.context
 from nova import db
-from nova import exception
-from nova import flags
+from nova.image import glance
 from nova import network
 from nova.network import model as network_model
-from nova.openstack.common import cfg
+from nova.openstack.common import excutils
 from nova.openstack.common import log
 from nova.openstack.common.notifier import api as notifier_api
 from nova.openstack.common import timeutils
@@ -33,33 +35,31 @@ from nova import utils
 
 LOG = log.getLogger(__name__)
 
-notify_state_opt = cfg.StrOpt('notify_on_state_change', default=None,
-    help='If set, send compute.instance.update notifications on instance '
-         'state changes.  Valid values are None for no notifications, '
-         '"vm_state" for notifications on VM state changes, or '
-         '"vm_and_task_state" for notifications on VM and task state '
-         'changes.')
+notify_opts = [
+    cfg.StrOpt('notify_on_state_change', default=None,
+        help='If set, send compute.instance.update notifications on instance '
+             'state changes.  Valid values are None for no notifications, '
+             '"vm_state" for notifications on VM state changes, or '
+             '"vm_and_task_state" for notifications on VM and task state '
+             'changes.'),
+    cfg.BoolOpt('notify_on_any_change', default=False,
+        help='If set, send compute.instance.update notifications on instance '
+             'state changes.  Valid values are False for no notifications, '
+             'True for notifications on any instance changes.'),
+    cfg.BoolOpt('notify_api_faults', default=False,
+        help='If set, send api.fault notifications on caught exceptions '
+             'in the API service.'),
+]
 
-notify_any_opt = cfg.BoolOpt('notify_on_any_change', default=False,
-    help='If set, send compute.instance.update notifications on instance '
-         'state changes.  Valid values are False for no notifications, '
-         'True for notifications on any instance changes.')
 
-notify_api_faults = cfg.BoolOpt('notify_api_faults', default=False,
-    help='If set, send api.fault notifications on caught exceptions '
-         'in the API service.')
-
-
-FLAGS = flags.FLAGS
-FLAGS.register_opt(notify_state_opt)
-FLAGS.register_opt(notify_any_opt)
-FLAGS.register_opt(notify_api_faults)
+CONF = cfg.CONF
+CONF.register_opts(notify_opts)
 
 
 def send_api_fault(url, status, exception):
     """Send an api.fault notification."""
 
-    if not FLAGS.notify_api_faults:
+    if not CONF.notify_api_faults:
         return
 
     payload = {'url': url, 'exception': str(exception), 'status': status}
@@ -75,7 +75,7 @@ def send_update(context, old_instance, new_instance, service=None, host=None):
     in that instance
     """
 
-    if not FLAGS.notify_on_any_change and not FLAGS.notify_on_state_change:
+    if not CONF.notify_on_any_change and not CONF.notify_on_state_change:
         # skip all this if updates are disabled
         return
 
@@ -91,8 +91,8 @@ def send_update(context, old_instance, new_instance, service=None, host=None):
     if old_vm_state != new_vm_state:
         # yes, the vm state is changing:
         update_with_state_change = True
-    elif FLAGS.notify_on_state_change:
-        if (FLAGS.notify_on_state_change.lower() == "vm_and_task_state" and
+    elif CONF.notify_on_state_change:
+        if (CONF.notify_on_state_change.lower() == "vm_and_task_state" and
             old_task_state != new_task_state):
             # yes, the task state is changing:
             update_with_state_change = True
@@ -106,8 +106,12 @@ def send_update(context, old_instance, new_instance, service=None, host=None):
 
     else:
         try:
+            old_display_name = None
+            if new_instance["display_name"] != old_instance["display_name"]:
+                old_display_name = old_instance["display_name"]
             _send_instance_update_notification(context, new_instance,
-                    service=service, host=host)
+                    service=service, host=host,
+                    old_display_name=old_display_name)
         except Exception:
             LOG.exception(_("Failed to send state update notification"),
                     instance=new_instance)
@@ -120,7 +124,7 @@ def send_update_with_states(context, instance, old_vm_state, new_vm_state,
     are any, in the instance
     """
 
-    if not FLAGS.notify_on_state_change:
+    if not CONF.notify_on_state_change:
         # skip all this if updates are disabled
         return
 
@@ -135,8 +139,8 @@ def send_update_with_states(context, instance, old_vm_state, new_vm_state,
         if old_vm_state != new_vm_state:
             # yes, the vm state is changing:
             fire_update = True
-        elif FLAGS.notify_on_state_change:
-            if (FLAGS.notify_on_state_change.lower() == "vm_and_task_state" and
+        elif CONF.notify_on_state_change:
+            if (CONF.notify_on_state_change.lower() == "vm_and_task_state" and
                 old_task_state != new_task_state):
                 # yes, the task state is changing:
                 fire_update = True
@@ -155,9 +159,10 @@ def send_update_with_states(context, instance, old_vm_state, new_vm_state,
 
 def _send_instance_update_notification(context, instance, old_vm_state=None,
             old_task_state=None, new_vm_state=None, new_task_state=None,
-            service="compute", host=None):
+            service="compute", host=None, old_display_name=None):
     """Send 'compute.instance.update' notification to inform observers
-    about instance state changes"""
+    about instance state changes.
+    """
 
     payload = info_from_instance(context, instance, None, None)
 
@@ -183,6 +188,10 @@ def _send_instance_update_notification(context, instance, old_vm_state=None,
     # add bw usage info:
     bw = bandwidth_usage(instance, audit_start)
     payload["bandwidth"] = bw
+
+    # add old display name if it is changed
+    if old_display_name:
+        payload["old_display_name"] = old_display_name
 
     publisher_id = notifier_api.publisher_id(service, host)
 
@@ -227,10 +236,14 @@ def bandwidth_usage(instance_ref, audit_start,
             nw_info = network.API().get_instance_nw_info(admin_context,
                     instance_ref)
         except Exception:
-            LOG.exception('Failed to get nw_info', instance=instance_ref)
-            if ignore_missing_network_data:
-                return
-            raise
+            try:
+                with excutils.save_and_reraise_exception():
+                    LOG.exception(_('Failed to get nw_info'),
+                                  instance=instance_ref)
+            except Exception:
+                if ignore_missing_network_data:
+                    return
+                raise
 
     macs = [vif['address'] for vif in nw_info]
     uuids = [instance_ref["uuid"]]
@@ -278,17 +291,13 @@ def info_from_instance(context, instance_ref, network_info,
     def null_safe_str(s):
         return str(s) if s else ''
 
-    image_ref_url = utils.generate_image_url(instance_ref['image_ref'])
+    image_ref_url = glance.generate_image_url(instance_ref['image_ref'])
 
-    instance_type_name = instance_ref.get('instance_type', {}).get('name', '')
+    instance_type = flavors.extract_flavor(instance_ref)
+    instance_type_name = instance_type.get('name', '')
 
     if system_metadata is None:
-        try:
-            system_metadata = db.instance_system_metadata_get(
-                    context, instance_ref['uuid'])
-
-        except exception.NotFound:
-            system_metadata = {}
+        system_metadata = utils.instance_sys_meta(instance_ref)
 
     instance_info = dict(
         # Owner properties
@@ -299,6 +308,7 @@ def info_from_instance(context, instance_ref, network_info,
         instance_id=instance_ref['uuid'],
         display_name=instance_ref['display_name'],
         reservation_id=instance_ref['reservation_id'],
+        hostname=instance_ref['hostname'],
 
         # Type properties
         instance_type=instance_type_name,
@@ -317,6 +327,7 @@ def info_from_instance(context, instance_ref, network_info,
 
         # Location properties
         host=instance_ref['host'],
+        node=instance_ref['node'],
         availability_zone=instance_ref['availability_zone'],
 
         # Date properties

@@ -1,4 +1,4 @@
-# Copyright (c) 2011-2012 OpenStack, LLC.
+# Copyright (c) 2011-2012 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -13,21 +13,47 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo.config import cfg
 
-from nova import flags
 from nova.scheduler import filters
 
-
-FLAGS = flags.FLAGS
+isolated_opts = [
+    cfg.ListOpt('isolated_images',
+                default=[],
+                help='Images to run on isolated host'),
+    cfg.ListOpt('isolated_hosts',
+                default=[],
+                help='Host reserved for specific images'),
+]
+CONF = cfg.CONF
+CONF.register_opts(isolated_opts)
 
 
 class IsolatedHostsFilter(filters.BaseHostFilter):
     """Returns host."""
 
     def host_passes(self, host_state, filter_properties):
+        """
+        Result Matrix:
+                     | isolated_image | non_isolated_image
+        -------------+----------------+-------------------
+        iso_host     |    True        |     False
+        non_iso_host |    False       |      True
+
+        """
+        # If the configuration does not list any hosts, the filter will always
+        # return True, assuming a configuration error, so letting all hosts
+        # through.
+        isolated_hosts = CONF.isolated_hosts
+        isolated_images = CONF.isolated_images
+        if not isolated_images:
+            # As there are no images to match, return False if the host is in
+            # the isolation list
+            return host_state.host not in isolated_hosts
+
         spec = filter_properties.get('request_spec', {})
         props = spec.get('instance_properties', {})
         image_ref = props.get('image_ref')
-        image_isolated = image_ref in FLAGS.isolated_images
-        host_isolated = host_state.host in FLAGS.isolated_hosts
+        image_isolated = image_ref in isolated_images
+        host_isolated = host_state.host in isolated_hosts
         return image_isolated == host_isolated

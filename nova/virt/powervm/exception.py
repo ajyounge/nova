@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 IBM
+# Copyright 2012 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -22,10 +22,14 @@ class PowerVMConnectionFailed(exception.NovaException):
 
 
 class PowerVMFileTransferFailed(exception.NovaException):
-    message = _("File '%(file_path)' transfer to PowerVM manager failed")
+    message = _("File '%(file_path)s' transfer to PowerVM manager failed")
 
 
-class PowerVMLPARInstanceNotFound(exception.NovaException):
+class PowerVMFTPTransferFailed(PowerVMFileTransferFailed):
+    message = _("FTP %(ftp_cmd)s from %(source_path)s to %(dest_path)s failed")
+
+
+class PowerVMLPARInstanceNotFound(exception.InstanceNotFound):
     message = _("LPAR instance '%(instance_name)s' could not be found")
 
 
@@ -39,6 +43,11 @@ class PowerVMNoSpaceLeftOnVolumeGroup(exception.NovaException):
 
 class PowerVMLPARAttributeNotFound(exception.NovaException):
     pass
+
+
+class PowerVMLPAROperationTimeout(exception.NovaException):
+    message = _("Operation '%(operation)s' on "
+                "LPAR '%(instance_name)s' timed out")
 
 
 class PowerVMImageCreationFailed(exception.NovaException):

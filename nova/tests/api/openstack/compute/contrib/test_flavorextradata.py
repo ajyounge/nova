@@ -1,4 +1,4 @@
-# Copyright 2012 OpenStack LLC.
+# Copyright 2012 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -17,13 +17,13 @@ import datetime
 
 import webob
 
-from nova.compute import instance_types
+from nova.compute import flavors
 from nova.openstack.common import jsonutils
 from nova import test
 from nova.tests.api.openstack import fakes
 
 
-def fake_get_instance_type_by_flavor_id(flavorid):
+def fake_get_flavor_by_flavor_id(flavorid):
     return {
         'id': flavorid,
         'flavorid': str(flavorid),
@@ -41,10 +41,10 @@ def fake_get_instance_type_by_flavor_id(flavorid):
     }
 
 
-def fake_get_all_types(inactive=0, filters=None):
+def fake_get_all_flavors(inactive=0, filters=None):
     return {
-        'fake1': fake_get_instance_type_by_flavor_id(1),
-        'fake2': fake_get_instance_type_by_flavor_id(2)
+        'fake1': fake_get_flavor_by_flavor_id(1),
+        'fake2': fake_get_flavor_by_flavor_id(2)
     }
 
 
@@ -54,9 +54,9 @@ class FlavorextradataTest(test.TestCase):
         ext = ('nova.api.openstack.compute.contrib'
               '.flavorextradata.Flavorextradata')
         self.flags(osapi_compute_extension=[ext])
-        self.stubs.Set(instance_types, 'get_instance_type_by_flavor_id',
-                                        fake_get_instance_type_by_flavor_id)
-        self.stubs.Set(instance_types, 'get_all_types', fake_get_all_types)
+        self.stubs.Set(flavors, 'get_flavor_by_flavor_id',
+                                        fake_get_flavor_by_flavor_id)
+        self.stubs.Set(flavors, 'get_all_flavors', fake_get_all_flavors)
 
     def _verify_flavor_response(self, flavor, expected):
         for key in expected:
@@ -77,7 +77,7 @@ class FlavorextradataTest(test.TestCase):
         url = '/v2/fake/flavors/1'
         req = webob.Request.blank(url)
         req.headers['Content-Type'] = 'application/json'
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(fakes.wsgi_app(init_only=('flavors',)))
         body = jsonutils.loads(res.body)
         self._verify_flavor_response(body['flavor'], expected['flavor'])
 
@@ -104,7 +104,7 @@ class FlavorextradataTest(test.TestCase):
         url = '/v2/fake/flavors/detail'
         req = webob.Request.blank(url)
         req.headers['Content-Type'] = 'application/json'
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(fakes.wsgi_app(init_only=('flavors',)))
         body = jsonutils.loads(res.body)
         for i, flavor in enumerate(body['flavors']):
             self._verify_flavor_response(flavor, expected[i])

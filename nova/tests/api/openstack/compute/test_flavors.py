@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC.
+# Copyright 2012 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -22,17 +22,13 @@ import urlparse
 
 from nova.api.openstack.compute import flavors
 from nova.api.openstack import xmlutil
-import nova.compute.instance_types
+import nova.compute.flavors
 from nova import context
 from nova import db
 from nova import exception
-from nova import flags
 from nova import test
 from nova.tests.api.openstack import fakes
-
-
-FLAGS = flags.FLAGS
-
+from nova.tests import matchers
 
 NS = "{http://docs.openstack.org/compute/api/v1.1}"
 ATOMNS = "{http://www.w3.org/2005/Atom}"
@@ -54,11 +50,11 @@ FAKE_FLAVORS = {
 }
 
 
-def fake_instance_type_get_by_flavor_id(flavorid):
+def fake_flavor_get_by_flavor_id(flavorid):
     return FAKE_FLAVORS['flavor %s' % flavorid]
 
 
-def fake_instance_type_get_all(inactive=False, filters=None):
+def fake_flavor_get_all(inactive=False, filters=None):
     def reject_min(db_attr, filter_attr):
         return (filter_attr in filters and
                 int(flavor[db_attr]) < int(filters[filter_attr]))
@@ -76,12 +72,12 @@ def fake_instance_type_get_all(inactive=False, filters=None):
     return output
 
 
-def empty_instance_type_get_all(inactive=False, filters=None):
+def empty_flavor_get_all(inactive=False, filters=None):
     return {}
 
 
-def return_instance_type_not_found(flavor_id):
-    raise exception.InstanceTypeNotFound(flavor_id=flavor_id)
+def return_flavor_not_found(flavor_id):
+    raise exception.InstanceTypeNotFound(instance_type_id=flavor_id)
 
 
 class FlavorsTest(test.TestCase):
@@ -90,18 +86,18 @@ class FlavorsTest(test.TestCase):
         self.flags(osapi_compute_extension=[])
         fakes.stub_out_networking(self.stubs)
         fakes.stub_out_rate_limiting(self.stubs)
-        self.stubs.Set(nova.compute.instance_types, "get_all_types",
-                       fake_instance_type_get_all)
-        self.stubs.Set(nova.compute.instance_types,
-                       "get_instance_type_by_flavor_id",
-                       fake_instance_type_get_by_flavor_id)
+        self.stubs.Set(nova.compute.flavors, "get_all_flavors",
+                       fake_flavor_get_all)
+        self.stubs.Set(nova.compute.flavors,
+                       "get_flavor_by_flavor_id",
+                       fake_flavor_get_by_flavor_id)
 
         self.controller = flavors.Controller()
 
     def test_get_flavor_by_invalid_id(self):
-        self.stubs.Set(nova.compute.instance_types,
-                       "get_instance_type_by_flavor_id",
-                       return_instance_type_not_found)
+        self.stubs.Set(nova.compute.flavors,
+                       "get_flavor_by_flavor_id",
+                       return_flavor_not_found)
         req = fakes.HTTPRequest.blank('/v2/fake/flavors/asdf')
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.show, req, 'asdf')
@@ -219,7 +215,7 @@ class FlavorsTest(test.TestCase):
                'rel': 'next'}
             ]
         }
-        self.assertDictMatch(flavor, expected)
+        self.assertThat(flavor, matchers.DictMatches(expected))
 
     def test_get_flavor_detail_with_limit(self):
         req = fakes.HTTPRequest.blank('/v2/fake/flavors/detail?limit=1')
@@ -251,7 +247,8 @@ class FlavorsTest(test.TestCase):
         href_parts = urlparse.urlparse(response_links[0]['href'])
         self.assertEqual('/v2/fake/flavors', href_parts.path)
         params = urlparse.parse_qs(href_parts.query)
-        self.assertDictMatch({'limit': ['1'], 'marker': ['1']}, params)
+        self.assertThat({'limit': ['1'], 'marker': ['1']},
+                        matchers.DictMatches(params))
 
     def test_get_flavor_with_limit(self):
         req = fakes.HTTPRequest.blank('/v2/fake/flavors?limit=2')
@@ -297,7 +294,8 @@ class FlavorsTest(test.TestCase):
         href_parts = urlparse.urlparse(response_links[0]['href'])
         self.assertEqual('/v2/fake/flavors', href_parts.path)
         params = urlparse.parse_qs(href_parts.query)
-        self.assertDictMatch({'limit': ['2'], 'marker': ['2']}, params)
+        self.assertThat({'limit': ['2'], 'marker': ['2']},
+                        matchers.DictMatches(params))
 
     def test_get_flavor_list_detail(self):
         req = fakes.HTTPRequest.blank('/v2/fake/flavors/detail')
@@ -343,8 +341,8 @@ class FlavorsTest(test.TestCase):
         self.assertEqual(flavor, expected)
 
     def test_get_empty_flavor_list(self):
-        self.stubs.Set(nova.compute.instance_types, "get_all_types",
-                       empty_instance_type_get_all)
+        self.stubs.Set(nova.compute.flavors, "get_all_flavors",
+                       empty_flavor_get_all)
 
         req = fakes.HTTPRequest.blank('/v2/fake/flavors')
         flavors = self.controller.index(req)
@@ -352,7 +350,7 @@ class FlavorsTest(test.TestCase):
         self.assertEqual(flavors, expected)
 
     def test_get_flavor_list_filter_min_ram(self):
-        """Flavor lists may be filtered by minRam."""
+        # Flavor lists may be filtered by minRam.
         req = fakes.HTTPRequest.blank('/v2/fake/flavors?minRam=512')
         flavor = self.controller.index(req)
         expected = {
@@ -376,13 +374,13 @@ class FlavorsTest(test.TestCase):
         self.assertEqual(flavor, expected)
 
     def test_get_flavor_list_filter_invalid_min_ram(self):
-        """Ensure you cannot list flavors with invalid minRam param."""
+        # Ensure you cannot list flavors with invalid minRam param.
         req = fakes.HTTPRequest.blank('/v2/fake/flavors?minRam=NaN')
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller.index, req)
 
     def test_get_flavor_list_filter_min_disk(self):
-        """Flavor lists may be filtered by minDisk."""
+        # Flavor lists may be filtered by minDisk.
         req = fakes.HTTPRequest.blank('/v2/fake/flavors?minDisk=20')
         flavor = self.controller.index(req)
         expected = {
@@ -406,7 +404,7 @@ class FlavorsTest(test.TestCase):
         self.assertEqual(flavor, expected)
 
     def test_get_flavor_list_filter_invalid_min_disk(self):
-        """Ensure you cannot list flavors with invalid minDisk param."""
+        # Ensure you cannot list flavors with invalid minDisk param.
         req = fakes.HTTPRequest.blank('/v2/fake/flavors?minDisk=NaN')
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller.index, req)
@@ -685,7 +683,7 @@ class DisabledFlavorsWithRealDBTest(test.TestCase):
         super(DisabledFlavorsWithRealDBTest, self).setUp()
         self.controller = flavors.Controller()
 
-        # Add a new disabled type to the list of instance_types/flavors
+        # Add a new disabled type to the list of flavors
         self.req = fakes.HTTPRequest.blank('/v2/fake/flavors')
         self.context = self.req.environ['nova.context']
         self.admin_context = context.get_admin_context()
@@ -764,3 +762,38 @@ class DisabledFlavorsWithRealDBTest(test.TestCase):
                 self.req, self.disabled_type['flavorid'])['flavor']
 
         self.assertEqual(flavor['name'], self.disabled_type['name'])
+
+
+class ParseIsPublicTest(test.TestCase):
+    def setUp(self):
+        super(ParseIsPublicTest, self).setUp()
+        self.controller = flavors.Controller()
+
+    def assertPublic(self, expected, is_public):
+        self.assertIs(expected, self.controller._parse_is_public(is_public),
+                      '%s did not return %s' % (is_public, expected))
+
+    def test_None(self):
+        self.assertPublic(True, None)
+
+    def test_truthy(self):
+        self.assertPublic(True, True)
+        self.assertPublic(True, 't')
+        self.assertPublic(True, 'true')
+        self.assertPublic(True, 'yes')
+        self.assertPublic(True, '1')
+
+    def test_falsey(self):
+        self.assertPublic(False, False)
+        self.assertPublic(False, 'f')
+        self.assertPublic(False, 'false')
+        self.assertPublic(False, 'no')
+        self.assertPublic(False, '0')
+
+    def test_string_none(self):
+        self.assertPublic(None, 'none')
+        self.assertPublic(None, 'None')
+
+    def test_other(self):
+        self.assertRaises(
+                webob.exc.HTTPBadRequest, self.assertPublic, None, 'other')

@@ -16,23 +16,23 @@
 import datetime
 
 from lxml import etree
+from oslo.config import cfg
 import webob
+from webob import exc
 
-import nova
 from nova.api.openstack.compute.contrib import volumes
-from nova.compute import instance_types
+from nova.compute import api as compute_api
+from nova.compute import flavors
 from nova import context
-import nova.db
-from nova import flags
+from nova import exception
 from nova.openstack.common import jsonutils
 from nova.openstack.common import timeutils
 from nova import test
 from nova.tests.api.openstack import fakes
-from nova import volume
-from webob import exc
+from nova.volume import cinder
 
-
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
+CONF.import_opt('password_length', 'nova.utils')
 
 FAKE_UUID = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
 FAKE_UUID_A = '00000000-aaaa-aaaa-aaaa-000000000000'
@@ -47,38 +47,52 @@ def fake_compute_api_create(cls, context, instance_type, image_href, **kwargs):
     global _block_device_mapping_seen
     _block_device_mapping_seen = kwargs.get('block_device_mapping')
 
-    inst_type = instance_types.get_instance_type_by_flavor_id(2)
+    inst_type = flavors.get_flavor_by_flavor_id(2)
     resv_id = None
     return ([{'id': 1,
-             'display_name': 'test_server',
-             'uuid': FAKE_UUID,
-             'instance_type': dict(inst_type),
-             'access_ip_v4': '1.2.3.4',
-             'access_ip_v6': 'fead::1234',
-             'image_ref': IMAGE_UUID,
-             'user_id': 'fake',
-             'project_id': 'fake',
-             'created_at': datetime.datetime(2010, 10, 10, 12, 0, 0),
-             'updated_at': datetime.datetime(2010, 11, 11, 11, 0, 0),
-             'progress': 0,
-             'fixed_ips': []
-             }], resv_id)
+              'display_name': 'test_server',
+              'uuid': FAKE_UUID,
+              'instance_type': dict(inst_type),
+              'access_ip_v4': '1.2.3.4',
+              'access_ip_v6': 'fead::1234',
+              'image_ref': IMAGE_UUID,
+              'user_id': 'fake',
+              'project_id': 'fake',
+              'created_at': datetime.datetime(2010, 10, 10, 12, 0, 0),
+              'updated_at': datetime.datetime(2010, 11, 11, 11, 0, 0),
+              'progress': 0,
+              'fixed_ips': []
+              }], resv_id)
 
 
 def fake_get_instance(self, context, instance_id):
-    return({'uuid': instance_id})
+    return {'uuid': instance_id}
+
+
+def fake_get_volume(self, context, id):
+    return {'id': 'woot'}
 
 
 def fake_attach_volume(self, context, instance, volume_id, device):
-    return()
+    pass
 
 
-def fake_detach_volume(self, context, volume_id):
-    return()
+def fake_detach_volume(self, context, instance, volume):
+    pass
+
+
+def fake_create_snapshot(self, context, volume, name, description):
+    return {'id': 123,
+            'volume_id': 'fakeVolId',
+            'status': 'available',
+            'volume_size': 123,
+            'created_at': '2013-01-01 00:00:01',
+            'display_name': 'myVolumeName',
+            'display_description': 'myVolumeDescription'}
 
 
 def fake_get_instance_bdms(self, context, instance):
-    return([{'id': 1,
+    return [{'id': 1,
              'instance_uuid': instance['uuid'],
              'device_name': '/dev/fake0',
              'delete_on_termination': 'False',
@@ -87,21 +101,25 @@ def fake_get_instance_bdms(self, context, instance):
              'volume_id': FAKE_UUID_A,
              'volume_size': 1},
             {'id': 2,
-             'instance_uuid':instance['uuid'],
+             'instance_uuid': instance['uuid'],
              'device_name': '/dev/fake1',
              'delete_on_termination': 'False',
              'virtual_name': 'MyNamesVirtual',
              'snapshot_id': None,
              'volume_id': FAKE_UUID_B,
-             'volume_size': 1}])
+             'volume_size': 1}]
 
 
 class BootFromVolumeTest(test.TestCase):
 
     def setUp(self):
         super(BootFromVolumeTest, self).setUp()
-        self.stubs.Set(nova.compute.API, 'create', fake_compute_api_create)
+        self.stubs.Set(compute_api.API, 'create', fake_compute_api_create)
         fakes.stub_out_nw_api(self.stubs)
+        self.flags(
+            osapi_compute_extension=[
+                'nova.api.openstack.compute.contrib.select_extensions'],
+            osapi_compute_ext_list=['Volumes'])
 
     def test_create_root_volume(self):
         body = dict(server=dict(
@@ -120,19 +138,16 @@ class BootFromVolumeTest(test.TestCase):
         req.method = 'POST'
         req.body = jsonutils.dumps(body)
         req.headers['content-type'] = 'application/json'
-        res = req.get_response(fakes.wsgi_app())
+        res = req.get_response(fakes.wsgi_app(
+            init_only=('os-volumes_boot', 'servers')))
         self.assertEqual(res.status_int, 202)
         server = jsonutils.loads(res.body)['server']
         self.assertEqual(FAKE_UUID, server['id'])
-        self.assertEqual(FLAGS.password_length, len(server['adminPass']))
+        self.assertEqual(CONF.password_length, len(server['adminPass']))
         self.assertEqual(len(_block_device_mapping_seen), 1)
         self.assertEqual(_block_device_mapping_seen[0]['volume_id'], 1)
         self.assertEqual(_block_device_mapping_seen[0]['device_name'],
                 '/dev/vda')
-
-
-def return_volume(context, volume_id):
-    return {'id': volume_id}
 
 
 class VolumeApiTest(test.TestCase):
@@ -140,16 +155,20 @@ class VolumeApiTest(test.TestCase):
         super(VolumeApiTest, self).setUp()
         fakes.stub_out_networking(self.stubs)
         fakes.stub_out_rate_limiting(self.stubs)
-        self.stubs.Set(nova.db, 'volume_get', return_volume)
 
-        self.stubs.Set(volume.api.API, "delete", fakes.stub_volume_delete)
-        self.stubs.Set(volume.api.API, "get", fakes.stub_volume_get)
-        self.stubs.Set(volume.api.API, "get_all", fakes.stub_volume_get_all)
+        self.stubs.Set(cinder.API, "delete", fakes.stub_volume_delete)
+        self.stubs.Set(cinder.API, "get", fakes.stub_volume_get)
+        self.stubs.Set(cinder.API, "get_all", fakes.stub_volume_get_all)
+        self.flags(
+            osapi_compute_extension=[
+                'nova.api.openstack.compute.contrib.select_extensions'],
+            osapi_compute_ext_list=['Volumes'])
 
         self.context = context.get_admin_context()
+        self.app = fakes.wsgi_app(init_only=('os-volumes',))
 
     def test_volume_create(self):
-        self.stubs.Set(volume.api.API, "create", fakes.stub_volume_create)
+        self.stubs.Set(cinder.API, "create", fakes.stub_volume_create)
 
         vol = {"size": 100,
                "display_name": "Volume Test Name",
@@ -160,7 +179,7 @@ class VolumeApiTest(test.TestCase):
         req.method = 'POST'
         req.body = jsonutils.dumps(body)
         req.headers['content-type'] = 'application/json'
-        resp = req.get_response(fakes.wsgi_app())
+        resp = req.get_response(self.app)
 
         self.assertEqual(resp.status_int, 200)
 
@@ -175,50 +194,68 @@ class VolumeApiTest(test.TestCase):
         self.assertEqual(resp_dict['volume']['availabilityZone'],
                          vol['availability_zone'])
 
+    def test_volume_create_bad(self):
+        def fake_volume_create(self, context, size, name, description,
+                               snapshot, **param):
+            raise exception.InvalidInput(reason="bad request data")
+
+        self.stubs.Set(cinder.API, "create", fake_volume_create)
+
+        vol = {"size": '#$?',
+               "display_name": "Volume Test Name",
+               "display_description": "Volume Test Desc",
+               "availability_zone": "zone1:host1"}
+        body = {"volume": vol}
+
+        req = fakes.HTTPRequest.blank('/v2/fake/os-volumes')
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          volumes.VolumeController().create, req, body)
+
     def test_volume_index(self):
         req = webob.Request.blank('/v2/fake/os-volumes')
-        resp = req.get_response(fakes.wsgi_app())
+        resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
 
     def test_volume_detail(self):
         req = webob.Request.blank('/v2/fake/os-volumes/detail')
-        resp = req.get_response(fakes.wsgi_app())
+        resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
 
     def test_volume_show(self):
         req = webob.Request.blank('/v2/fake/os-volumes/123')
-        resp = req.get_response(fakes.wsgi_app())
+        resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
 
     def test_volume_show_no_volume(self):
-        self.stubs.Set(volume.api.API, "get", fakes.stub_volume_get_notfound)
+        self.stubs.Set(cinder.API, "get", fakes.stub_volume_notfound)
 
         req = webob.Request.blank('/v2/fake/os-volumes/456')
-        resp = req.get_response(fakes.wsgi_app())
+        resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
 
     def test_volume_delete(self):
         req = webob.Request.blank('/v2/fake/os-volumes/123')
         req.method = 'DELETE'
-        resp = req.get_response(fakes.wsgi_app())
+        resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 202)
 
     def test_volume_delete_no_volume(self):
-        self.stubs.Set(volume.api.API, "get", fakes.stub_volume_get_notfound)
+        self.stubs.Set(cinder.API, "delete", fakes.stub_volume_notfound)
 
         req = webob.Request.blank('/v2/fake/os-volumes/456')
         req.method = 'DELETE'
-        resp = req.get_response(fakes.wsgi_app())
+        resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
 
 
 class VolumeAttachTests(test.TestCase):
     def setUp(self):
         super(VolumeAttachTests, self).setUp()
-        self.stubs.Set(nova.compute.API,
+        self.stubs.Set(compute_api.API,
                        'get_instance_bdms',
                        fake_get_instance_bdms)
-        self.stubs.Set(nova.compute.API, 'get', fake_get_instance)
+        self.stubs.Set(compute_api.API, 'get', fake_get_instance)
+        self.stubs.Set(cinder.API, 'get', fake_get_volume)
         self.context = context.get_admin_context()
         self.expected_show = {'volumeAttachment':
             {'device': '/dev/fake0',
@@ -239,7 +276,9 @@ class VolumeAttachTests(test.TestCase):
         self.assertEqual(self.expected_show, result)
 
     def test_delete(self):
-        self.stubs.Set(nova.compute.API, 'detach_volume', fake_detach_volume)
+        self.stubs.Set(compute_api.API,
+                       'detach_volume',
+                       fake_detach_volume)
         attachments = volumes.VolumeAttachmentController()
         req = webob.Request.blank('/v2/fake/os-volumes/delete')
         req.method = 'POST'
@@ -251,7 +290,9 @@ class VolumeAttachTests(test.TestCase):
         self.assertEqual('202 Accepted', result.status)
 
     def test_delete_vol_not_found(self):
-        self.stubs.Set(nova.compute.API, 'detach_volume', fake_detach_volume)
+        self.stubs.Set(compute_api.API,
+                       'detach_volume',
+                       fake_detach_volume)
         attachments = volumes.VolumeAttachmentController()
         req = webob.Request.blank('/v2/fake/os-volumes/delete')
         req.method = 'POST'
@@ -266,7 +307,9 @@ class VolumeAttachTests(test.TestCase):
                           FAKE_UUID_C)
 
     def test_attach_volume(self):
-        self.stubs.Set(nova.compute.API, 'attach_volume', fake_attach_volume)
+        self.stubs.Set(compute_api.API,
+                       'attach_volume',
+                       fake_attach_volume)
         attachments = volumes.VolumeAttachmentController()
         body = {'volumeAttachment': {'volumeId': FAKE_UUID_A,
                                     'device': '/dev/fake'}}
@@ -278,6 +321,27 @@ class VolumeAttachTests(test.TestCase):
         result = attachments.create(req, FAKE_UUID, body)
         self.assertEqual(result['volumeAttachment']['id'],
             '00000000-aaaa-aaaa-aaaa-000000000000')
+
+    def test_attach_volume_bad_id(self):
+        self.stubs.Set(compute_api.API,
+                       'attach_volume',
+                       fake_attach_volume)
+        attachments = volumes.VolumeAttachmentController()
+
+        body = {
+            'volumeAttachment': {
+                'device': None,
+                'volumeId': 'TESTVOLUME',
+            }
+        }
+
+        req = fakes.HTTPRequest.blank('/v2/fake/os-volumes/attach')
+        req.method = 'POST'
+        req.content_type = 'application/json'
+        req.body = jsonutils.dumps(body)
+
+        self.assertRaises(webob.exc.HTTPBadRequest, attachments.create,
+                          req, FAKE_UUID, body)
 
 
 class VolumeSerializerTest(test.TestCase):
@@ -317,7 +381,6 @@ class VolumeSerializerTest(test.TestCase):
             device='/foo')
         text = serializer.serialize(dict(volumeAttachment=raw_attach))
 
-        print text
         tree = etree.fromstring(text)
 
         self.assertEqual('volumeAttachment', tree.tag)
@@ -337,7 +400,6 @@ class VolumeSerializerTest(test.TestCase):
                 device='/foo2')]
         text = serializer.serialize(dict(volumeAttachments=raw_attaches))
 
-        print text
         tree = etree.fromstring(text)
 
         self.assertEqual('volumeAttachments', tree.tag)
@@ -370,7 +432,6 @@ class VolumeSerializerTest(test.TestCase):
             )
         text = serializer.serialize(dict(volume=raw_volume))
 
-        print text
         tree = etree.fromstring(text)
 
         self._verify_volume(raw_volume, tree)
@@ -419,7 +480,6 @@ class VolumeSerializerTest(test.TestCase):
                 )]
         text = serializer.serialize(dict(volumes=raw_volumes))
 
-        print text
         tree = etree.fromstring(text)
 
         self.assertEqual('volumes', tree.tag)
@@ -618,3 +678,29 @@ class UnprocessableSnapshotTestCase(CommonUnprocessableEntityTestCase,
     resource = 'os-snapshots'
     entity_name = 'snapshot'
     controller_cls = volumes.SnapshotController
+
+
+class CreateSnapshotTestCase(test.TestCase):
+    def setUp(self):
+        super(CreateSnapshotTestCase, self).setUp()
+        self.controller = volumes.SnapshotController()
+        self.stubs.Set(cinder.API, 'get', fake_get_volume)
+        self.stubs.Set(cinder.API, 'create_snapshot_force',
+                       fake_create_snapshot)
+        self.stubs.Set(cinder.API, 'create_snapshot', fake_create_snapshot)
+        self.req = fakes.HTTPRequest.blank('/v2/fake/os-snapshots')
+        self.req.method = 'POST'
+        self.body = {'snapshot': {'volume_id': 1}}
+
+    def test_force_true(self):
+        self.body['snapshot']['force'] = 'True'
+        self.controller.create(self.req, body=self.body)
+
+    def test_force_false(self):
+        self.body['snapshot']['force'] = 'f'
+        self.controller.create(self.req, body=self.body)
+
+    def test_force_invalid(self):
+        self.body['snapshot']['force'] = 'foo'
+        self.assertRaises(exception.InvalidParameterValue,
+                          self.controller.create, self.req, body=self.body)

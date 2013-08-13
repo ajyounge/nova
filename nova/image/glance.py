@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2010 OpenStack LLC.
+# Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,29 +15,73 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""Implementation of an image service that uses Glance as the backend"""
+"""Implementation of an image service that uses Glance as the backend."""
 
 from __future__ import absolute_import
 
 import copy
 import itertools
 import random
+import shutil
 import sys
 import time
 import urlparse
 
 import glanceclient
 import glanceclient.exc
+from oslo.config import cfg
 
 from nova import exception
-from nova import flags
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
 
+glance_opts = [
+    cfg.StrOpt('glance_host',
+               default='$my_ip',
+               help='default glance hostname or ip'),
+    cfg.IntOpt('glance_port',
+               default=9292,
+               help='default glance port'),
+    cfg.StrOpt('glance_protocol',
+                default='http',
+                help='Default protocol to use when connecting to glance. '
+                     'Set to https for SSL.'),
+    cfg.ListOpt('glance_api_servers',
+                default=['$glance_host:$glance_port'],
+                help='A list of the glance api servers available to nova. '
+                     'Prefix with https:// for ssl-based glance api servers. '
+                     '([hostname|ip]:port)'),
+    cfg.BoolOpt('glance_api_insecure',
+                default=False,
+                help='Allow to perform insecure SSL (https) requests to '
+                     'glance'),
+    cfg.IntOpt('glance_num_retries',
+               default=0,
+               help='Number retries when downloading an image from glance'),
+    cfg.ListOpt('allowed_direct_url_schemes',
+                default=[],
+                help='A list of url scheme that can be downloaded directly '
+                     'via the direct_url.  Currently supported schemes: '
+                     '[file].'),
+    ]
 
 LOG = logging.getLogger(__name__)
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
+CONF.register_opts(glance_opts)
+CONF.import_opt('auth_strategy', 'nova.api.auth')
+CONF.import_opt('my_ip', 'nova.netconf')
+
+
+def generate_glance_url():
+    """Generate the URL to glance."""
+    return "%s://%s:%d" % (CONF.glance_protocol, CONF.glance_host,
+                           CONF.glance_port)
+
+
+def generate_image_url(image_ref):
+    """Generate an image URL from an image_ref."""
+    return "%s/images/%s" % (generate_glance_url(), image_ref)
 
 
 def _parse_image_ref(image_href):
@@ -57,14 +101,14 @@ def _parse_image_ref(image_href):
 
 
 def _create_glance_client(context, host, port, use_ssl, version=1):
-    """Instantiate a new glanceclient.Client object"""
+    """Instantiate a new glanceclient.Client object."""
     if use_ssl:
         scheme = 'https'
     else:
         scheme = 'http'
     params = {}
-    params['insecure'] = FLAGS.glance_api_insecure
-    if FLAGS.auth_strategy == 'keystone':
+    params['insecure'] = CONF.glance_api_insecure
+    if CONF.auth_strategy == 'keystone':
         params['token'] = context.auth_token
     endpoint = '%s://%s:%s' % (scheme, host, port)
     return glanceclient.Client(str(version), endpoint, **params)
@@ -72,12 +116,12 @@ def _create_glance_client(context, host, port, use_ssl, version=1):
 
 def get_api_servers():
     """
-    Shuffle a list of FLAGS.glance_api_servers and return an iterator
+    Shuffle a list of CONF.glance_api_servers and return an iterator
     that will cycle through the list, looping around to the beginning
     if necessary.
     """
     api_servers = []
-    for api_server in FLAGS.glance_api_servers:
+    for api_server in CONF.glance_api_servers:
         if '//' not in api_server:
             api_server = 'http://' + api_server
         o = urlparse.urlparse(api_server)
@@ -124,12 +168,12 @@ class GlanceClientWrapper(object):
     def call(self, context, version, method, *args, **kwargs):
         """
         Call a glance client method.  If we get a connection error,
-        retry the request according to FLAGS.glance_num_retries.
+        retry the request according to CONF.glance_num_retries.
         """
         retry_excs = (glanceclient.exc.ServiceUnavailable,
                 glanceclient.exc.InvalidEndpoint,
                 glanceclient.exc.CommunicationError)
-        num_attempts = 1 + FLAGS.glance_num_retries
+        num_attempts = 1 + CONF.glance_num_retries
 
         for attempt in xrange(1, num_attempts + 1):
             client = self.client or self._create_onetime_client(context,
@@ -177,13 +221,13 @@ class GlanceImageService(object):
         accepted_params = ('filters', 'marker', 'limit',
                            'sort_key', 'sort_dir')
         for param in accepted_params:
-            if param in params:
+            if params.get(param):
                 _params[param] = params.get(param)
 
         # ensure filters is a dict
-        params.setdefault('filters', {})
+        _params.setdefault('filters', {})
         # NOTE(vish): don't filter out private images
-        params['filters'].setdefault('is_public', 'none')
+        _params['filters'].setdefault('is_public', 'none')
 
         return _params
 
@@ -202,7 +246,8 @@ class GlanceImageService(object):
 
     def get_location(self, context, image_id):
         """Returns the direct url representing the backend storage location,
-        or None if this attribute is not shown by Glance."""
+        or None if this attribute is not shown by Glance.
+        """
         try:
             client = GlanceClientWrapper()
             image_meta = client.call(context, 2, 'get', image_id)
@@ -214,15 +259,30 @@ class GlanceImageService(object):
 
         return getattr(image_meta, 'direct_url', None)
 
-    def download(self, context, image_id, data):
-        """Calls out to Glance for metadata and data and writes data."""
+    def download(self, context, image_id, data=None):
+        """Calls out to Glance for data and writes data."""
+        if 'file' in CONF.allowed_direct_url_schemes:
+            location = self.get_location(context, image_id)
+            o = urlparse.urlparse(location)
+            if o.scheme == "file":
+                with open(o.path, "r") as f:
+                    # FIXME(jbresnah) a system call to cp could have
+                    # significant performance advantages, however we
+                    # do not have the path to files at this point in
+                    # the abstraction.
+                    shutil.copyfileobj(f, data)
+                return
+
         try:
             image_chunks = self._client.call(context, 1, 'data', image_id)
         except Exception:
             _reraise_translated_image_exception(image_id)
 
-        for chunk in image_chunks:
-            data.write(chunk)
+        if data is None:
+            return image_chunks
+        else:
+            for chunk in image_chunks:
+                data.write(chunk)
 
     def create(self, context, image_meta, data=None):
         """Store the image data and return the new image object."""
@@ -231,8 +291,11 @@ class GlanceImageService(object):
         if data:
             sent_service_image_meta['data'] = data
 
-        recv_service_image_meta = self._client.call(context, 1, 'create',
-                                                    **sent_service_image_meta)
+        try:
+            recv_service_image_meta = self._client.call(
+                context, 1, 'create', **sent_service_image_meta)
+        except glanceclient.exc.HTTPException:
+            _reraise_translated_exception()
 
         return self._translate_from_glance(recv_service_image_meta)
 
@@ -259,12 +322,15 @@ class GlanceImageService(object):
 
         :raises: ImageNotFound if the image does not exist.
         :raises: NotAuthorized if the user is not an owner.
+        :raises: ImageNotAuthorized if the user is not authorized.
 
         """
         try:
             self._client.call(context, 1, 'delete', image_id)
         except glanceclient.exc.NotFound:
             raise exception.ImageNotFound(image_id=image_id)
+        except glanceclient.exc.HTTPForbidden:
+            raise exception.ImageNotAuthorized(image_id=image_id)
         return True
 
     @staticmethod
@@ -426,6 +492,8 @@ def get_remote_image_service(context, image_href):
     :returns: a tuple of the form (image_service, image_id)
 
     """
+    # Calling out to another service may take a while, so lets log this
+    LOG.debug(_("fetching image %s from glance") % image_href)
     #NOTE(bcwaldon): If image_href doesn't look like a URI, assume its a
     # standalone image ID
     if '/' not in str(image_href):

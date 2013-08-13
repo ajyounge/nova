@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2010-2011 OpenStack LLC.
+# Copyright 2010-2011 OpenStack Foundation
 # Copyright 2011 Piston Cloud Computing, Inc.
 # All Rights Reserved.
 #
@@ -22,8 +22,10 @@ from nova.api.openstack import common
 from nova.api.openstack.compute.views import addresses as views_addresses
 from nova.api.openstack.compute.views import flavors as views_flavors
 from nova.api.openstack.compute.views import images as views_images
+from nova.compute import flavors
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
+from nova import utils
 
 
 LOG = logging.getLogger(__name__)
@@ -53,14 +55,6 @@ class ViewBuilder(common.ViewBuilder):
         self._flavor_builder = views_flavors.ViewBuilder()
         self._image_builder = views_images.ViewBuilder()
 
-    def _skip_precooked(func):
-        def wrapped(self, request, instance):
-            if instance.get("_is_precooked"):
-                return dict(server=instance)
-            else:
-                return func(self, request, instance)
-        return wrapped
-
     def create(self, request, instance):
         """View that should be returned when an instance is created."""
         return {
@@ -72,7 +66,6 @@ class ViewBuilder(common.ViewBuilder):
             },
         }
 
-    @_skip_precooked
     def basic(self, request, instance):
         """Generic, non-detailed view of an instance."""
         return {
@@ -85,7 +78,6 @@ class ViewBuilder(common.ViewBuilder):
             },
         }
 
-    @_skip_precooked
     def show(self, request, instance):
         """Detailed view of a single instance."""
         server = {
@@ -141,8 +133,7 @@ class ViewBuilder(common.ViewBuilder):
 
     @staticmethod
     def _get_metadata(instance):
-        metadata = instance.get("metadata", [])
-        return dict((item['key'], item['value']) for item in metadata)
+        return utils.instance_meta(instance)
 
     @staticmethod
     def _get_vm_state(instance):
@@ -164,20 +155,23 @@ class ViewBuilder(common.ViewBuilder):
 
     def _get_image(self, request, instance):
         image_ref = instance["image_ref"]
-        image_id = str(common.get_id_from_href(image_ref))
-        bookmark = self._image_builder._get_bookmark_link(request,
-                                                          image_id,
-                                                          "images")
-        return {
-            "id": image_id,
-            "links": [{
-                "rel": "bookmark",
-                "href": bookmark,
-            }],
-        }
+        if image_ref:
+            image_id = str(common.get_id_from_href(image_ref))
+            bookmark = self._image_builder._get_bookmark_link(request,
+                                                              image_id,
+                                                              "images")
+            return {
+                "id": image_id,
+                "links": [{
+                    "rel": "bookmark",
+                    "href": bookmark,
+                }],
+            }
+        else:
+            return ""
 
     def _get_flavor(self, request, instance):
-        instance_type = instance["instance_type"]
+        instance_type = flavors.extract_flavor(instance)
         if not instance_type:
             LOG.warn(_("Instance has had its instance_type removed "
                     "from the DB"), instance=instance)
@@ -208,9 +202,9 @@ class ViewBuilder(common.ViewBuilder):
 
         if fault.get('details', None):
             is_admin = False
-            context = getattr(request, 'context', None)
+            context = request.environ["nova.context"]
             if context:
-                is_admin = getattr(request.context, 'is_admin', False)
+                is_admin = getattr(context, 'is_admin', False)
 
             if is_admin or fault['code'] != 500:
                 fault_dict['details'] = fault["details"]

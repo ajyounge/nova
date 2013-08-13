@@ -41,8 +41,8 @@ server side of the API at the same time.  However, as the code stands today,
 there can be both versioned and unversioned APIs implemented in the same code
 base.
 
-
-EXAMPLES:
+EXAMPLES
+========
 
 Nova was the first project to use versioned rpc APIs.  Consider the compute rpc
 API as an example.  The client side is in nova/compute/rpcapi.py and the server
@@ -50,12 +50,13 @@ side is in nova/compute/manager.py.
 
 
 Example 1) Adding a new method.
+-------------------------------
 
 Adding a new method is a backwards compatible change.  It should be added to
 nova/compute/manager.py, and RPC_API_VERSION should be bumped from X.Y to
 X.Y+1.  On the client side, the new method in nova/compute/rpcapi.py should
 have a specific version specified to indicate the minimum API version that must
-be implemented for the method to be supported.  For example:
+be implemented for the method to be supported.  For example::
 
     def get_host_uptime(self, ctxt, host):
         topic = _compute_topic(self.topic, ctxt, host, None)
@@ -67,10 +68,11 @@ get_host_uptime() method.
 
 
 Example 2) Adding a new parameter.
+----------------------------------
 
 Adding a new parameter to an rpc method can be made backwards compatible.  The
 RPC_API_VERSION on the server side (nova/compute/manager.py) should be bumped.
-The implementation of the method must not expect the parameter to be present.
+The implementation of the method must not expect the parameter to be present.::
 
     def some_remote_method(self, arg1, arg2, newarg=None):
         # The code needs to deal with newarg=None for cases
@@ -82,6 +84,7 @@ minimum version that supports the new parameter should be specified.
 """
 
 from nova.openstack.common.rpc import common as rpc_common
+from nova.openstack.common.rpc import serializer as rpc_serializer
 
 
 class RpcDispatcher(object):
@@ -91,38 +94,48 @@ class RpcDispatcher(object):
     contains a list of underlying managers that have an API_VERSION attribute.
     """
 
-    def __init__(self, callbacks):
+    def __init__(self, callbacks, serializer=None):
         """Initialize the rpc dispatcher.
 
         :param callbacks: List of proxy objects that are an instance
                           of a class with rpc methods exposed.  Each proxy
                           object should have an RPC_API_VERSION attribute.
+        :param serializer: The Serializer object that will be used to
+                           deserialize arguments before the method call and
+                           to serialize the result after it returns.
         """
         self.callbacks = callbacks
+        if serializer is None:
+            serializer = rpc_serializer.NoOpSerializer()
+        self.serializer = serializer
         super(RpcDispatcher, self).__init__()
 
-    @staticmethod
-    def _is_compatible(mversion, version):
-        """Determine whether versions are compatible.
+    def _deserialize_args(self, context, kwargs):
+        """Helper method called to deserialize args before dispatch.
 
-        :param mversion: The API version implemented by a callback.
-        :param version: The API version requested by an incoming message.
+        This calls our serializer on each argument, returning a new set of
+        args that have been deserialized.
+
+        :param context: The request context
+        :param kwargs: The arguments to be deserialized
+        :returns: A new set of deserialized args
         """
-        version_parts = version.split('.')
-        mversion_parts = mversion.split('.')
-        if int(version_parts[0]) != int(mversion_parts[0]):  # Major
-            return False
-        if int(version_parts[1]) > int(mversion_parts[1]):  # Minor
-            return False
-        return True
+        new_kwargs = dict()
+        for argname, arg in kwargs.iteritems():
+            new_kwargs[argname] = self.serializer.deserialize_entity(context,
+                                                                     arg)
+        return new_kwargs
 
-    def dispatch(self, ctxt, version, method, **kwargs):
+    def dispatch(self, ctxt, version, method, namespace, **kwargs):
         """Dispatch a message based on a requested version.
 
         :param ctxt: The request context
         :param version: The requested API version from the incoming message
         :param method: The method requested to be called by the incoming
                        message.
+        :param namespace: The namespace for the requested method.  If None,
+                          the dispatcher will look for a method on a callback
+                          object with no namespace set.
         :param kwargs: A dict of keyword arguments to be passed to the method.
 
         :returns: Whatever is returned by the underlying method that gets
@@ -133,16 +146,31 @@ class RpcDispatcher(object):
 
         had_compatible = False
         for proxyobj in self.callbacks:
-            if hasattr(proxyobj, 'RPC_API_VERSION'):
+            # Check for namespace compatibility
+            try:
+                cb_namespace = proxyobj.RPC_API_NAMESPACE
+            except AttributeError:
+                cb_namespace = None
+
+            if namespace != cb_namespace:
+                continue
+
+            # Check for version compatibility
+            try:
                 rpc_api_version = proxyobj.RPC_API_VERSION
-            else:
+            except AttributeError:
                 rpc_api_version = '1.0'
-            is_compatible = self._is_compatible(rpc_api_version, version)
+
+            is_compatible = rpc_common.version_is_compatible(rpc_api_version,
+                                                             version)
             had_compatible = had_compatible or is_compatible
+
             if not hasattr(proxyobj, method):
                 continue
             if is_compatible:
-                return getattr(proxyobj, method)(ctxt, **kwargs)
+                kwargs = self._deserialize_args(ctxt, kwargs)
+                result = getattr(proxyobj, method)(ctxt, **kwargs)
+                return self.serializer.serialize_entity(ctxt, result)
 
         if had_compatible:
             raise AttributeError("No such RPC function '%s'" % method)

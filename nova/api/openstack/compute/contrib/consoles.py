@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC.
+# Copyright 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -12,7 +12,7 @@
 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
-#    under the License
+#    under the License.
 
 import webob
 
@@ -20,10 +20,8 @@ from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova import compute
 from nova import exception
-from nova.openstack.common import log as logging
 
 
-LOG = logging.getLogger(__name__)
 authorize = extensions.extension_authorizer('compute', 'consoles')
 
 
@@ -47,16 +45,40 @@ class ConsolesController(wsgi.Controller):
                                                       instance,
                                                       console_type)
         except exception.InstanceNotFound as e:
-            raise webob.exc.HTTPNotFound(explanation=unicode(e))
+            raise webob.exc.HTTPNotFound(explanation=e.format_message())
         except exception.InstanceNotReady as e:
-            raise webob.exc.HTTPConflict(explanation=unicode(e))
+            raise webob.exc.HTTPConflict(
+                    explanation=_('Instance not yet ready'))
+
+        return {'console': {'type': console_type, 'url': output['url']}}
+
+    @wsgi.action('os-getSPICEConsole')
+    def get_spice_console(self, req, id, body):
+        """Get text console output."""
+        context = req.environ['nova.context']
+        authorize(context)
+
+        # If type is not supplied or unknown, get_spice_console below will cope
+        console_type = body['os-getSPICEConsole'].get('type')
+
+        try:
+            instance = self.compute_api.get(context, id)
+            output = self.compute_api.get_spice_console(context,
+                                                      instance,
+                                                      console_type)
+        except exception.InstanceNotFound as e:
+            raise webob.exc.HTTPNotFound(explanation=e.format_message())
+        except exception.InstanceNotReady as e:
+            raise webob.exc.HTTPConflict(explanation=e.format_message())
 
         return {'console': {'type': console_type, 'url': output['url']}}
 
     def get_actions(self):
         """Return the actions the extension adds, as required by contract."""
         actions = [extensions.ActionExtension("servers", "os-getVNCConsole",
-                                              self.get_vnc_console)]
+                                              self.get_vnc_console),
+                   extensions.ActionExtension("servers", "os-getSPICEConsole",
+                                              self.get_spice_console)]
         return actions
 
 

@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2011 OpenStack, LLC.
+# Copyright (c) 2011 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -14,17 +14,16 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from nova import flags
-from nova.openstack.common import cfg
-from nova import utils
+from oslo.config import cfg
 
+from nova import utils
 
 ipv6_backend_opt = cfg.StrOpt('ipv6_backend',
                               default='rfc2462',
                               help='Backend to use for IPv6 generation')
 
-FLAGS = flags.FLAGS
-FLAGS.register_opt(ipv6_backend_opt)
+CONF = cfg.CONF
+CONF.register_opt(ipv6_backend_opt)
 IMPL = None
 
 

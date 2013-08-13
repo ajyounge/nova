@@ -1,7 +1,7 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 # Copyright (c) 2012 Citrix Systems, Inc.
-# Copyright 2010 OpenStack LLC.
+# Copyright 2010 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -19,15 +19,13 @@
 Management class for host-related functions (start, reboot, etc).
 """
 
-import logging
-
 from nova.compute import task_states
 from nova.compute import vm_states
 from nova import context
-from nova import db
 from nova import exception
-from nova import notifications
+from nova.objects import instance as instance_obj
 from nova.openstack.common import jsonutils
+from nova.openstack.common import log as logging
 from nova.virt.xenapi import pool_states
 from nova.virt.xenapi import vm_utils
 
@@ -38,8 +36,9 @@ class Host(object):
     """
     Implements host related operations.
     """
-    def __init__(self, session):
+    def __init__(self, session, virtapi):
         self._session = session
+        self._virtapi = virtapi
 
     def host_power_action(self, _host, action):
         """Reboots or shuts down the host."""
@@ -50,7 +49,8 @@ class Host(object):
 
     def host_maintenance_mode(self, host, mode):
         """Start/Stop host maintenance window. On start, it triggers
-        guest VMs evacuation."""
+        guest VMs evacuation.
+        """
         if not mode:
             return 'off_maintenance'
         host_list = [host_ref for host_ref in
@@ -67,43 +67,43 @@ class Host(object):
                         name = vm_rec['name_label']
                         uuid = _uuid_find(ctxt, host, name)
                         if not uuid:
-                            msg = _('Instance %(name)s running on %(host)s'
-                                    ' could not be found in the database:'
-                                    ' assuming it is a worker VM and skip'
-                                    ' ping migration to a new host')
-                            LOG.info(msg % locals())
+                            LOG.info(_('Instance %(name)s running on %(host)s'
+                                       ' could not be found in the database:'
+                                       ' assuming it is a worker VM and skip'
+                                       ' ping migration to a new host'),
+                                     {'name': name, 'host': host})
                             continue
-                    instance = db.instance_get_by_uuid(ctxt, uuid)
+                    instance = instance_obj.Instance.get_by_uuid(ctxt, uuid)
                     vm_counter = vm_counter + 1
 
-                    dest = _host_find(ctxt, self._session, host, host_ref)
-                    (old_ref, new_ref) = db.instance_update_and_get_original(
-                                    ctxt,
-                                    instance['uuid'],
-                                    {'host': dest,
-                                     'task_state': task_states.MIGRATING})
-                    notifications.send_update(ctxt, old_ref, new_ref)
+                    aggregate = self._virtapi.aggregate_get_by_host(
+                        ctxt, host, key=pool_states.POOL_FLAG)
+                    if not aggregate:
+                        msg = _('Aggregate for host %(host)s count not be'
+                                ' found.') % dict(host=host)
+                        raise exception.NotFound(msg)
+
+                    dest = _host_find(ctxt, self._session, aggregate[0],
+                                      host_ref)
+                    instance.host = dest
+                    instance.task_state = task_states.MIGRATING
+                    instance.save()
 
                     self._session.call_xenapi('VM.pool_migrate',
                                               vm_ref, host_ref, {})
                     migrations_counter = migrations_counter + 1
 
-                    (old_ref, new_ref) = db.instance_update_and_get_original(
-                                ctxt,
-                                instance['uuid'],
-                                {'vm_state': vm_states.ACTIVE})
-                    notifications.send_update(ctxt, old_ref, new_ref)
+                    instance.vm_state = vm_states.ACTIVE
+                    instance.save()
 
                     break
                 except self._session.XenAPI.Failure:
-                    LOG.exception('Unable to migrate VM %(vm_ref)s'
-                                  'from %(host)s' % locals())
-                    (old_ref, new_ref) = db.instance_update_and_get_original(
-                                ctxt,
-                                instance['uuid'],
-                                {'hosts': host,
-                                 'vm_state': vm_states.ACTIVE})
-                    notifications.send_update(ctxt, old_ref, new_ref)
+                    LOG.exception(_('Unable to migrate VM %(vm_ref)s '
+                                    'from %(host)s'),
+                                  {'vm_ref': vm_ref, 'host': host})
+                    instance.host = host
+                    instance.vm_state = vm_states.ACTIVE
+                    instance.save()
 
         if vm_counter == migrations_counter:
             return 'on_maintenance'
@@ -148,13 +148,7 @@ class HostState(object):
         LOG.debug(_("Updating host stats"))
         data = call_xenhost(self._session, "host_data", {})
         if data:
-            try:
-                # Get the SR usage
-                sr_ref = vm_utils.safe_find_sr(self._session)
-            except exception.NotFound as e:
-                # No SR configured
-                LOG.error(_("Unable to get SR for this host: %s") % e)
-                return
+            sr_ref = vm_utils.safe_find_sr(self._session)
             self._session.call_xenapi("SR.scan", sr_ref)
             sr_rec = self._session.call_xenapi("SR.get_record", sr_ref)
             total = int(sr_rec["physical_size"])
@@ -173,6 +167,7 @@ class HostState(object):
                 data["host_memory_free_computed"] = host_memory.get(
                                                     'free-computed', 0)
                 del data['host_memory']
+            data['hypervisor_hostname'] = data['host_hostname']
             self._stats = data
 
 
@@ -208,38 +203,35 @@ def call_xenhost(session, method, arg_dict):
         return None
     except session.XenAPI.Failure as e:
         LOG.error(_("The call to %(method)s returned "
-                    "an error: %(e)s.") % locals())
+                    "an error: %(e)s."), {'method': method, 'e': e})
         return e.details[1]
 
 
 def _uuid_find(context, host, name_label):
     """Return instance uuid by name_label."""
-    for i in db.instance_get_all_by_host(context, host):
+    for i in instance_obj.InstanceList.get_by_host(context, host):
         if i.name == name_label:
-            return i['uuid']
+            return i.uuid
     return None
 
 
-def _host_find(context, session, src, dst):
+def _host_find(context, session, src_aggregate, dst):
     """Return the host from the xenapi host reference.
 
-    :param src: the compute host being put in maintenance (source of VMs)
+    :param src_aggregate: the aggregate that the compute host being put in
+                          maintenance (source of VMs) belongs to
     :param dst: the hypervisor host reference (destination of VMs)
 
     :return: the compute host that manages dst
     """
     # NOTE: this would be a lot simpler if nova-compute stored
-    # FLAGS.host in the XenServer host's other-config map.
+    # CONF.host in the XenServer host's other-config map.
     # TODO(armando-migliaccio): improve according the note above
-    aggregate = db.aggregate_get_by_host(context, src,
-            key=pool_states.POOL_FLAG)[0]
-    if not aggregate:
-        raise exception.AggregateHostNotFound(host=src)
     uuid = session.call_xenapi('host.get_record', dst)['uuid']
-    for compute_host, host_uuid in aggregate.metadetails.iteritems():
+    for compute_host, host_uuid in src_aggregate.metadetails.iteritems():
         if host_uuid == uuid:
             return compute_host
     raise exception.NoValidHost(reason='Host %(host_uuid)s could not be found '
                                 'from aggregate metadata: %(metadata)s.' %
                                 {'host_uuid': uuid,
-                                 'metadata': aggregate.metadetails})
+                                 'metadata': src_aggregate.metadetails})

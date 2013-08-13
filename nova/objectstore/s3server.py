@@ -2,7 +2,7 @@
 #
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
-# Copyright 2010 OpenStack LLC.
+# Copyright 2010 OpenStack Foundation
 # Copyright 2009 Facebook
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -41,18 +41,19 @@ import os
 import os.path
 import urllib
 
+from oslo.config import cfg
 import routes
 import webob
 
-from nova import flags
-from nova.openstack.common import cfg
+from nova.openstack.common import fileutils
+from nova import paths
 from nova import utils
 from nova import wsgi
 
 
 s3_opts = [
     cfg.StrOpt('buckets_path',
-               default='$state_path/buckets',
+               default=paths.state_path_def('buckets'),
                help='path to s3 buckets'),
     cfg.StrOpt('s3_listen',
                default="0.0.0.0",
@@ -62,15 +63,15 @@ s3_opts = [
                help='port for s3 api to listen'),
 ]
 
-FLAGS = flags.FLAGS
-FLAGS.register_opts(s3_opts)
+CONF = cfg.CONF
+CONF.register_opts(s3_opts)
 
 
 def get_wsgi_server():
     return wsgi.Server("S3 Objectstore",
-                       S3Application(FLAGS.buckets_path),
-                       port=FLAGS.s3_listen_port,
-                       host=FLAGS.s3_listen)
+                       S3Application(CONF.buckets_path),
+                       port=CONF.s3_listen_port,
+                       host=CONF.s3_listen)
 
 
 class S3Application(wsgi.Router):
@@ -93,7 +94,7 @@ class S3Application(wsgi.Router):
         mapper.connect('/{bucket_name}/',
                 controller=lambda *a, **kw: BucketHandler(self)(*a, **kw))
         self.directory = os.path.abspath(root_directory)
-        utils.ensure_tree(self.directory)
+        fileutils.ensure_tree(self.directory)
         self.bucket_depth = bucket_depth
         super(S3Application, self).__init__(mapper)
 
@@ -153,6 +154,13 @@ class BaseRequestHandler(object):
 
     def set_status(self, status_code):
         self.response.status = status_code
+
+    def set_404(self):
+        self.render_xml({"Error": {
+            "Code": "NoSuchKey",
+            "Message": "The resource you requested does not exist"
+            }})
+        self.set_status(404)
 
     def finish(self, body=''):
         self.response.body = utils.utf8(body)
@@ -232,7 +240,7 @@ class BucketHandler(BaseRequestHandler):
         terse = int(self.get_argument("terse", 0))
         if (not path.startswith(self.application.directory) or
             not os.path.isdir(path)):
-            self.set_status(404)
+            self.set_404()
             return
         object_names = []
         for root, dirs, files in os.walk(path):
@@ -285,7 +293,7 @@ class BucketHandler(BaseRequestHandler):
             os.path.exists(path)):
             self.set_status(403)
             return
-        utils.ensure_tree(path)
+        fileutils.ensure_tree(path)
         self.finish()
 
     def delete(self, bucket_name):
@@ -293,7 +301,7 @@ class BucketHandler(BaseRequestHandler):
             self.application.directory, bucket_name))
         if (not path.startswith(self.application.directory) or
             not os.path.isdir(path)):
-            self.set_status(404)
+            self.set_404()
             return
         if len(os.listdir(path)) > 0:
             self.set_status(403)
@@ -309,7 +317,7 @@ class ObjectHandler(BaseRequestHandler):
         path = self._object_path(bucket, object_name)
         if (not path.startswith(self.application.directory) or
             not os.path.isfile(path)):
-            self.set_status(404)
+            self.set_404()
             return
         info = os.stat(path)
         self.set_header("Content-Type", "application/unknown")
@@ -327,14 +335,14 @@ class ObjectHandler(BaseRequestHandler):
             self.application.directory, bucket))
         if (not bucket_dir.startswith(self.application.directory) or
             not os.path.isdir(bucket_dir)):
-            self.set_status(404)
+            self.set_404()
             return
         path = self._object_path(bucket, object_name)
         if not path.startswith(bucket_dir) or os.path.isdir(path):
             self.set_status(403)
             return
         directory = os.path.dirname(path)
-        utils.ensure_tree(directory)
+        fileutils.ensure_tree(directory)
         object_file = open(path, "w")
         object_file.write(self.request.body)
         object_file.close()
@@ -347,7 +355,7 @@ class ObjectHandler(BaseRequestHandler):
         path = self._object_path(bucket, object_name)
         if (not path.startswith(self.application.directory) or
             not os.path.isfile(path)):
-            self.set_status(404)
+            self.set_404()
             return
         os.unlink(path)
         self.set_status(204)

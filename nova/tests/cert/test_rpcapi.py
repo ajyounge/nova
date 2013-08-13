@@ -18,14 +18,14 @@
 Unit Tests for nova.cert.rpcapi
 """
 
+from oslo.config import cfg
+
 from nova.cert import rpcapi as cert_rpcapi
 from nova import context
-from nova import flags
 from nova.openstack.common import rpc
 from nova import test
 
-
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
 
 
 class CertRpcAPITestCase(test.TestCase):
@@ -33,8 +33,9 @@ class CertRpcAPITestCase(test.TestCase):
         ctxt = context.RequestContext('fake_user', 'fake_project')
         rpcapi = cert_rpcapi.CertAPI()
         expected_retval = 'foo'
+        expected_version = kwargs.pop('version', rpcapi.BASE_RPC_API_VERSION)
         expected_msg = rpcapi.make_msg(method, **kwargs)
-        expected_msg['version'] = rpcapi.BASE_RPC_API_VERSION
+        expected_msg['version'] = expected_version
 
         self.call_ctxt = None
         self.call_topic = None
@@ -54,7 +55,7 @@ class CertRpcAPITestCase(test.TestCase):
 
         self.assertEqual(retval, expected_retval)
         self.assertEqual(self.call_ctxt, ctxt)
-        self.assertEqual(self.call_topic, FLAGS.cert_topic)
+        self.assertEqual(self.call_topic, CONF.cert_topic)
         self.assertEqual(self.call_msg, expected_msg)
         self.assertEqual(self.call_timeout, None)
 

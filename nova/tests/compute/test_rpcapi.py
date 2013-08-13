@@ -18,26 +18,26 @@
 Unit Tests for nova.compute.rpcapi
 """
 
+from oslo.config import cfg
+
 from nova.compute import rpcapi as compute_rpcapi
 from nova import context
 from nova import db
-from nova import flags
 from nova.openstack.common import jsonutils
 from nova.openstack.common import rpc
 from nova import test
 
-
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
 
 
 class ComputeRpcAPITestCase(test.TestCase):
 
     def setUp(self):
+        super(ComputeRpcAPITestCase, self).setUp()
         self.context = context.get_admin_context()
         inst = db.instance_create(self.context, {'host': 'fake_host',
                                                  'instance_type_id': 1})
         self.fake_instance = jsonutils.to_primitive(inst)
-        super(ComputeRpcAPITestCase, self).setUp()
 
     def test_serialized_instance_has_name(self):
         self.assertTrue('name' in self.fake_instance)
@@ -74,7 +74,7 @@ class ComputeRpcAPITestCase(test.TestCase):
             host = kwargs['destination']
         else:
             host = kwargs['instance']['host']
-        expected_topic = '%s.%s' % (FLAGS.compute_topic, host)
+        expected_topic = '%s.%s' % (CONF.compute_topic, host)
 
         self.fake_args = None
         self.fake_kwargs = None
@@ -95,8 +95,9 @@ class ComputeRpcAPITestCase(test.TestCase):
             self.assertEqual(arg, expected_arg)
 
     def test_add_aggregate_host(self):
-        self._test_compute_api('add_aggregate_host', 'cast', aggregate_id='id',
-                host_param='host', host='host', slave_info={}, version='2.2')
+        self._test_compute_api('add_aggregate_host', 'cast',
+                aggregate={'id': 'fake_id'}, host_param='host', host='host',
+                slave_info={}, version='2.14')
 
     def test_add_fixed_ip_to_instance(self):
         self._test_compute_api('add_fixed_ip_to_instance', 'cast',
@@ -121,15 +122,19 @@ class ComputeRpcAPITestCase(test.TestCase):
                 instance=self.fake_instance,
                 dest_check_data={"test": "data"})
 
+    def test_check_instance_shared_storage(self):
+        self._test_compute_api('check_instance_shared_storage', 'call',
+                instance=self.fake_instance, data='foo', version='2.28')
+
     def test_confirm_resize_cast(self):
         self._test_compute_api('confirm_resize', 'cast',
-                instance=self.fake_instance, migration_id='id', host='host',
-                reservations=list('fake_res'))
+                instance=self.fake_instance, migration={'id': 'foo'},
+                host='host', reservations=list('fake_res'), version='2.7')
 
     def test_confirm_resize_call(self):
         self._test_compute_api('confirm_resize', 'call',
-                instance=self.fake_instance, migration_id='id', host='host',
-                reservations=list('fake_res'))
+                instance=self.fake_instance, migration={'id': 'foo'},
+                host='host', reservations=list('fake_res'), version='2.7')
 
     def test_detach_volume(self):
         self._test_compute_api('detach_volume', 'cast',
@@ -137,14 +142,14 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_finish_resize(self):
         self._test_compute_api('finish_resize', 'cast',
-                instance=self.fake_instance, migration_id='id',
+                instance=self.fake_instance, migration={'id': 'foo'},
                 image='image', disk_info='disk_info', host='host',
-                reservations=list('fake_res'))
+                reservations=list('fake_res'), version='2.8')
 
     def test_finish_revert_resize(self):
         self._test_compute_api('finish_revert_resize', 'cast',
-                instance=self.fake_instance, migration_id='id', host='host',
-                reservations=list('fake_res'))
+                instance=self.fake_instance, migration={'id': 'fake_id'},
+                host='host', reservations=list('fake_res'), version='2.13')
 
     def test_get_console_output(self):
         self._test_compute_api('get_console_output', 'call',
@@ -164,6 +169,17 @@ class ComputeRpcAPITestCase(test.TestCase):
     def test_get_vnc_console(self):
         self._test_compute_api('get_vnc_console', 'call',
                 instance=self.fake_instance, console_type='type')
+
+    def test_get_spice_console(self):
+        self._test_compute_api('get_spice_console', 'call',
+                instance=self.fake_instance, console_type='type',
+                version='2.24')
+
+    def test_validate_console_port(self):
+        self._test_compute_api('validate_console_port', 'call',
+                instance=self.fake_instance, port="5900",
+                console_type="novnc",
+                version="2.26")
 
     def test_host_maintenance_mode(self):
         self._test_compute_api('host_maintenance_mode', 'call',
@@ -204,31 +220,59 @@ class ComputeRpcAPITestCase(test.TestCase):
         self._test_compute_api('power_on_instance', 'cast',
                 instance=self.fake_instance)
 
+    def test_soft_delete_instance(self):
+        self._test_compute_api('soft_delete_instance', 'cast',
+                instance=self.fake_instance,
+                reservations=['uuid1', 'uuid2'],
+                version='2.27')
+
+    def test_restore_instance(self):
+        self._test_compute_api('restore_instance', 'cast',
+                instance=self.fake_instance)
+
     def test_pre_live_migration(self):
         self._test_compute_api('pre_live_migration', 'call',
                 instance=self.fake_instance, block_migration='block_migration',
-                disk='disk', host='host')
+                disk='disk', host='host', migrate_data=None,
+                version='2.21')
 
     def test_prep_resize(self):
         self._test_compute_api('prep_resize', 'cast',
                 instance=self.fake_instance, instance_type='fake_type',
                 image='fake_image', host='host',
-                reservations=list('fake_res'))
+                reservations=list('fake_res'),
+                request_spec='fake_spec',
+                filter_properties={'fakeprop': 'fakeval'},
+                node='node',
+                version='2.20')
 
     def test_reboot_instance(self):
+        self.maxDiff = None
         self._test_compute_api('reboot_instance', 'cast',
-                instance=self.fake_instance, reboot_type='type')
+                instance=self.fake_instance,
+                block_device_info={},
+                reboot_type='type',
+                version='2.23')
 
     def test_rebuild_instance(self):
         self._test_compute_api('rebuild_instance', 'cast',
                 instance=self.fake_instance, new_pass='pass',
                 injected_files='files', image_ref='ref',
-                orig_image_ref='orig_ref',
-                orig_sys_metadata='orig_sys_metadata', version='2.1')
+                orig_image_ref='orig_ref', bdms=[], recreate=False,
+                on_shared_storage=False, orig_sys_metadata='orig_sys_metadata',
+                version='2.22')
+
+    def test_rebuild_instance_with_shared(self):
+        self._test_compute_api('rebuild_instance', 'cast', new_pass='None',
+                injected_files='None', image_ref='None', orig_image_ref='None',
+                bdms=[], instance=self.fake_instance, host='new_host',
+                orig_sys_metadata=None, recreate=True, on_shared_storage=True,
+                version='2.22')
 
     def test_reserve_block_device_name(self):
         self._test_compute_api('reserve_block_device_name', 'call',
-                instance=self.fake_instance, device='device')
+                instance=self.fake_instance, device='device', volume_id='id',
+                version='2.3')
 
     def refresh_provider_fw_rules(self):
         self._test_compute_api('refresh_provider_fw_rules', 'cast',
@@ -246,8 +290,8 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_remove_aggregate_host(self):
         self._test_compute_api('remove_aggregate_host', 'cast',
-                aggregate_id='id', host_param='host', host='host',
-                slave_info={}, version='2.2')
+                aggregate={'id': 'fake_id'}, host_param='host', host='host',
+                slave_info={}, version='2.15')
 
     def test_remove_fixed_ip_from_instance(self):
         self._test_compute_api('remove_fixed_ip_from_instance', 'cast',
@@ -267,8 +311,9 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_resize_instance(self):
         self._test_compute_api('resize_instance', 'cast',
-                instance=self.fake_instance, migration_id='id', image='image',
-                reservations=list('fake_res'))
+                instance=self.fake_instance, migration={'id': 'fake_id'},
+                image='image', instance_type={'id': 1},
+                reservations=list('fake_res'), version='2.16')
 
     def test_resume_instance(self):
         self._test_compute_api('resume_instance', 'cast',
@@ -276,8 +321,8 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_revert_resize(self):
         self._test_compute_api('revert_resize', 'cast',
-                instance=self.fake_instance, migration_id='id', host='host',
-                reservations=list('fake_res'))
+                instance=self.fake_instance, migration={'id': 'fake_id'},
+                host='host', reservations=list('fake_res'), version='2.12')
 
     def test_rollback_live_migration_at_destination(self):
         self._test_compute_api('rollback_live_migration_at_destination',
@@ -288,7 +333,8 @@ class ComputeRpcAPITestCase(test.TestCase):
                 instance=self.fake_instance, host='fake_host',
                 request_spec='fake_spec', filter_properties={},
                 requested_networks='networks', injected_files='files',
-                admin_password='pw', is_first_time=True)
+                admin_password='pw', is_first_time=True, node='node',
+                version='2.19')
 
     def test_set_admin_password(self):
         self._test_compute_api('set_admin_password', 'call',
@@ -308,15 +354,15 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_start_instance(self):
         self._test_compute_api('start_instance', 'cast',
-                instance=self.fake_instance)
+                instance=self.fake_instance, version='2.29')
 
     def test_stop_instance_cast(self):
         self._test_compute_api('stop_instance', 'cast',
-                instance=self.fake_instance)
+                instance=self.fake_instance, version='2.29')
 
     def test_stop_instance_call(self):
         self._test_compute_api('stop_instance', 'call',
-                instance=self.fake_instance)
+                instance=self.fake_instance, version='2.29')
 
     def test_suspend_instance(self):
         self._test_compute_api('suspend_instance', 'cast',
@@ -324,7 +370,9 @@ class ComputeRpcAPITestCase(test.TestCase):
 
     def test_terminate_instance(self):
         self._test_compute_api('terminate_instance', 'cast',
-                instance=self.fake_instance)
+                instance=self.fake_instance, bdms=[],
+                reservations=['uuid1', 'uuid2'],
+                version='2.27')
 
     def test_unpause_instance(self):
         self._test_compute_api('unpause_instance', 'cast',

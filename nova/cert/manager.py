@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack, LLC.
+# Copyright 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -27,16 +27,15 @@ Cert manager manages x509 certificates.
 import base64
 
 from nova import crypto
-from nova import flags
 from nova import manager
-from nova.openstack.common import log as logging
-
-LOG = logging.getLogger(__name__)
-FLAGS = flags.FLAGS
 
 
 class CertManager(manager.Manager):
-    RPC_API_VERSION = '1.0'
+    RPC_API_VERSION = '1.1'
+
+    def __init__(self, *args, **kwargs):
+        super(CertManager, self).__init__(service_name='cert',
+                                          *args, **kwargs)
 
     def init_host(self):
         crypto.ensure_ca_filesystem()
@@ -54,17 +53,22 @@ class CertManager(manager.Manager):
         return crypto.revoke_certs_by_user_and_project(user_id, project_id)
 
     def generate_x509_cert(self, context, user_id, project_id):
-        """Generate and sign a cert for user in project"""
+        """Generate and sign a cert for user in project."""
         return crypto.generate_x509_cert(user_id, project_id)
 
     def fetch_ca(self, context, project_id):
-        """Get root ca for a project"""
+        """Get root ca for a project."""
         return crypto.fetch_ca(project_id)
 
     def fetch_crl(self, context, project_id):
-        """Get crl for a project"""
+        """Get crl for a project."""
         return crypto.fetch_crl(project_id)
 
     def decrypt_text(self, context, project_id, text):
         """Decrypt base64 encoded text using the projects private key."""
         return crypto.decrypt_text(project_id, base64.b64decode(text))
+
+    # NOTE(russellb) This method can be removed in 2.0 of this API.  It is
+    # deprecated in favor of the method in the base API.
+    def get_backdoor_port(self, context):
+        return self.backdoor_port

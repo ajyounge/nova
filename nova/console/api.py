@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010 OpenStack, LLC.
+# Copyright (c) 2010 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -17,15 +17,16 @@
 
 """Handles ConsoleProxy API requests."""
 
+from oslo.config import cfg
+
 from nova.compute import rpcapi as compute_rpcapi
 from nova.console import rpcapi as console_rpcapi
 from nova.db import base
-from nova import flags
 from nova.openstack.common import rpc
-from nova import utils
+from nova.openstack.common import uuidutils
 
-
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
+CONF.import_opt('console_topic', 'nova.console.rpcapi')
 
 
 class API(base.Base):
@@ -42,7 +43,7 @@ class API(base.Base):
 
     def delete_console(self, context, instance_uuid, console_uuid):
         console = self.db.console_get(context, console_uuid, instance_uuid)
-        topic = rpc.queue_get_for(context, FLAGS.console_topic,
+        topic = rpc.queue_get_for(context, CONF.console_topic,
                                   console['pool']['host'])
         rpcapi = console_rpcapi.ConsoleAPI(topic=topic)
         rpcapi.remove_console(context, console['id'])
@@ -63,7 +64,7 @@ class API(base.Base):
         return rpcapi.get_console_topic(context, instance_host)
 
     def _get_instance(self, context, instance_uuid):
-        if utils.is_uuid_like(instance_uuid):
+        if uuidutils.is_uuid_like(instance_uuid):
             instance = self.db.instance_get_by_uuid(context, instance_uuid)
         else:
             instance = self.db.instance_get(context, instance_uuid)

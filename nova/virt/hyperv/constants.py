@@ -35,13 +35,28 @@ HYPERV_POWER_STATE = {
     HYPERV_VM_STATE_SUSPENDED: power_state.SUSPENDED
 }
 
-REQ_POWER_STATE = {
-    'Enabled': HYPERV_VM_STATE_ENABLED,
-    'Disabled': HYPERV_VM_STATE_DISABLED,
-    'Reboot': HYPERV_VM_STATE_REBOOT,
-    'Reset': HYPERV_VM_STATE_RESET,
-    'Paused': HYPERV_VM_STATE_PAUSED,
-    'Suspended': HYPERV_VM_STATE_SUSPENDED,
+WMI_WIN32_PROCESSOR_ARCHITECTURE = {
+    0: 'x86',
+    1: 'MIPS',
+    2: 'Alpha',
+    3: 'PowerPC',
+    5: 'ARM',
+    6: 'Itanium-based systems',
+    9: 'x64',
+}
+
+PROCESSOR_FEATURE = {
+    7: '3dnow',
+    3: 'mmx',
+    12: 'nx',
+    9: 'pae',
+    8: 'rdtsc',
+    20: 'slat',
+    13: 'sse3',
+    21: 'vmx',
+    6: 'sse',
+    10: 'sse2',
+    17: 'xsave',
 }
 
 WMI_JOB_STATUS_STARTED = 4096
@@ -52,3 +67,6 @@ VM_SUMMARY_NUM_PROCS = 4
 VM_SUMMARY_ENABLED_STATE = 100
 VM_SUMMARY_MEMORY_USAGE = 103
 VM_SUMMARY_UPTIME = 105
+
+IDE_DISK = "VHD"
+IDE_DVD = "DVD"

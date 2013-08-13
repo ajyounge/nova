@@ -1,4 +1,4 @@
-# Copyright (c) 2011 OpenStack, LLC
+# Copyright (c) 2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,118 +15,306 @@
 """
 Tests For HostManager
 """
-
-
 from nova.compute import task_states
 from nova.compute import vm_states
 from nova import db
 from nova import exception
 from nova.openstack.common import timeutils
+from nova.scheduler import filters
 from nova.scheduler import host_manager
 from nova import test
+from nova.tests import matchers
 from nova.tests.scheduler import fakes
 
 
-class ComputeFilterClass1(object):
-    def host_passes(self, *args, **kwargs):
+class FakeFilterClass1(filters.BaseHostFilter):
+    def host_passes(self, host_state, filter_properties):
         pass
 
 
-class ComputeFilterClass2(object):
-    def host_passes(self, *args, **kwargs):
+class FakeFilterClass2(filters.BaseHostFilter):
+    def host_passes(self, host_state, filter_properties):
         pass
 
 
-class HostManagerTestCase(test.TestCase):
-    """Test case for HostManager class"""
+class HostManagerTestCase(test.NoDBTestCase):
+    """Test case for HostManager class."""
 
     def setUp(self):
         super(HostManagerTestCase, self).setUp()
         self.host_manager = host_manager.HostManager()
+        self.fake_hosts = [host_manager.HostState('fake_host%s' % x,
+                'fake-node') for x in xrange(1, 5)]
+        self.fake_hosts += [host_manager.HostState('fake_multihost',
+                'fake-node%s' % x) for x in xrange(1, 5)]
+        self.addCleanup(timeutils.clear_time_override)
 
     def test_choose_host_filters_not_found(self):
-        self.flags(scheduler_default_filters='ComputeFilterClass3')
-        self.host_manager.filter_classes = [ComputeFilterClass1,
-                ComputeFilterClass2]
+        self.flags(scheduler_default_filters='FakeFilterClass3')
+        self.host_manager.filter_classes = [FakeFilterClass1,
+                FakeFilterClass2]
         self.assertRaises(exception.SchedulerHostFilterNotFound,
                 self.host_manager._choose_host_filters, None)
 
     def test_choose_host_filters(self):
-        self.flags(scheduler_default_filters=['ComputeFilterClass2'])
-        self.host_manager.filter_classes = [ComputeFilterClass1,
-                ComputeFilterClass2]
+        self.flags(scheduler_default_filters=['FakeFilterClass2'])
+        self.host_manager.filter_classes = [FakeFilterClass1,
+                FakeFilterClass2]
 
-        # Test 'compute' returns 1 correct function
-        filter_fns = self.host_manager._choose_host_filters(None)
-        self.assertEqual(len(filter_fns), 1)
-        self.assertEqual(filter_fns[0].__func__,
-                ComputeFilterClass2.host_passes.__func__)
+        # Test we returns 1 correct function
+        filter_classes = self.host_manager._choose_host_filters(None)
+        self.assertEqual(len(filter_classes), 1)
+        self.assertEqual(filter_classes[0].__name__, 'FakeFilterClass2')
 
-    def test_filter_hosts(self):
-        topic = 'fake_topic'
+    def _mock_get_filtered_hosts(self, info, specified_filters=None):
+        self.mox.StubOutWithMock(self.host_manager, '_choose_host_filters')
 
-        filters = ['fake-filter1', 'fake-filter2']
-        fake_host1 = host_manager.HostState('host1', topic)
-        fake_host2 = host_manager.HostState('host2', topic)
-        hosts = [fake_host1, fake_host2]
-        filter_properties = {'fake_prop': 'fake_val'}
+        info['got_objs'] = []
+        info['got_fprops'] = []
 
-        self.mox.StubOutWithMock(self.host_manager,
-                '_choose_host_filters')
-        self.mox.StubOutWithMock(fake_host1, 'passes_filters')
-        self.mox.StubOutWithMock(fake_host2, 'passes_filters')
+        def fake_filter_one(_self, obj, filter_props):
+            info['got_objs'].append(obj)
+            info['got_fprops'].append(filter_props)
+            return True
 
-        self.host_manager._choose_host_filters(None).AndReturn(filters)
-        fake_host1.passes_filters(filters, filter_properties).AndReturn(
-                False)
-        fake_host2.passes_filters(filters, filter_properties).AndReturn(
-                True)
+        self.stubs.Set(FakeFilterClass1, '_filter_one', fake_filter_one)
+        self.host_manager._choose_host_filters(specified_filters).AndReturn(
+                [FakeFilterClass1])
+
+    def _verify_result(self, info, result, filters=True):
+        for x in info['got_fprops']:
+            self.assertEqual(x, info['expected_fprops'])
+        if filters:
+            self.assertEqual(set(info['expected_objs']), set(info['got_objs']))
+        self.assertEqual(set(info['expected_objs']), set(result))
+
+    def test_get_filtered_hosts(self):
+        fake_properties = {'moo': 1, 'cow': 2}
+
+        info = {'expected_objs': self.fake_hosts,
+                'expected_fprops': fake_properties}
+
+        self._mock_get_filtered_hosts(info)
 
         self.mox.ReplayAll()
-        filtered_hosts = self.host_manager.filter_hosts(hosts,
-                filter_properties, filters=None)
-        self.assertEqual(len(filtered_hosts), 1)
-        self.assertEqual(filtered_hosts[0], fake_host2)
+        result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                fake_properties)
+        self._verify_result(info, result)
+
+    def test_get_filtered_hosts_with_specificed_filters(self):
+        fake_properties = {'moo': 1, 'cow': 2}
+
+        specified_filters = ['FakeFilterClass1', 'FakeFilterClass2']
+        info = {'expected_objs': self.fake_hosts,
+                'expected_fprops': fake_properties}
+        self._mock_get_filtered_hosts(info, specified_filters)
+
+        self.mox.ReplayAll()
+
+        result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                fake_properties, filter_class_names=specified_filters)
+        self._verify_result(info, result)
+
+    def test_get_filtered_hosts_with_ignore(self):
+        fake_properties = {'ignore_hosts': ['fake_host1', 'fake_host3',
+            'fake_host5', 'fake_multihost']}
+
+        # [1] and [3] are host2 and host4
+        info = {'expected_objs': [self.fake_hosts[1], self.fake_hosts[3]],
+                'expected_fprops': fake_properties}
+        self._mock_get_filtered_hosts(info)
+
+        self.mox.ReplayAll()
+
+        result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                fake_properties)
+        self._verify_result(info, result)
+
+    def test_get_filtered_hosts_with_force_hosts(self):
+        fake_properties = {'force_hosts': ['fake_host1', 'fake_host3',
+            'fake_host5']}
+
+        # [0] and [2] are host1 and host3
+        info = {'expected_objs': [self.fake_hosts[0], self.fake_hosts[2]],
+                'expected_fprops': fake_properties}
+        self._mock_get_filtered_hosts(info)
+
+        self.mox.ReplayAll()
+
+        result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                fake_properties)
+        self._verify_result(info, result, False)
+
+    def test_get_filtered_hosts_with_no_matching_force_hosts(self):
+        fake_properties = {'force_hosts': ['fake_host5', 'fake_host6']}
+
+        info = {'expected_objs': [],
+                'expected_fprops': fake_properties}
+        self._mock_get_filtered_hosts(info)
+
+        self.mox.ReplayAll()
+
+        result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                fake_properties)
+        self._verify_result(info, result, False)
+
+    def test_get_filtered_hosts_with_ignore_and_force_hosts(self):
+        # Ensure ignore_hosts processed before force_hosts in host filters.
+        fake_properties = {'force_hosts': ['fake_host3', 'fake_host1'],
+                           'ignore_hosts': ['fake_host1']}
+
+        # only fake_host3 should be left.
+        info = {'expected_objs': [self.fake_hosts[2]],
+                'expected_fprops': fake_properties}
+        self._mock_get_filtered_hosts(info)
+
+        self.mox.ReplayAll()
+
+        result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                fake_properties)
+        self._verify_result(info, result, False)
+
+    def test_get_filtered_hosts_with_force_host_and_many_nodes(self):
+        # Ensure all nodes returned for a host with many nodes
+        fake_properties = {'force_hosts': ['fake_multihost']}
+
+        info = {'expected_objs': [self.fake_hosts[4], self.fake_hosts[5],
+                                  self.fake_hosts[6], self.fake_hosts[7]],
+                'expected_fprops': fake_properties}
+        self._mock_get_filtered_hosts(info)
+
+        self.mox.ReplayAll()
+
+        result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                fake_properties)
+        self._verify_result(info, result, False)
+
+    def test_get_filtered_hosts_with_force_nodes(self):
+        fake_properties = {'force_nodes': ['fake-node2', 'fake-node4',
+                                           'fake-node9']}
+
+        # [5] is fake-node2, [7] is fake-node4
+        info = {'expected_objs': [self.fake_hosts[5], self.fake_hosts[7]],
+                'expected_fprops': fake_properties}
+        self._mock_get_filtered_hosts(info)
+
+        self.mox.ReplayAll()
+
+        result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                fake_properties)
+        self._verify_result(info, result, False)
+
+    def test_get_filtered_hosts_with_force_hosts_and_nodes(self):
+        # Ensure only overlapping results if both force host and node
+        fake_properties = {'force_hosts': ['fake_host1', 'fake_multihost'],
+                           'force_nodes': ['fake-node2', 'fake-node9']}
+
+        # [5] is fake-node2
+        info = {'expected_objs': [self.fake_hosts[5]],
+                'expected_fprops': fake_properties}
+        self._mock_get_filtered_hosts(info)
+
+        self.mox.ReplayAll()
+
+        result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                fake_properties)
+        self._verify_result(info, result, False)
+
+    def test_get_filtered_hosts_with_force_hosts_and_wrong_nodes(self):
+        # Ensure non-overlapping force_node and force_host yield no result
+        fake_properties = {'force_hosts': ['fake_multihost'],
+                           'force_nodes': ['fake-node']}
+
+        info = {'expected_objs': [],
+                'expected_fprops': fake_properties}
+        self._mock_get_filtered_hosts(info)
+
+        self.mox.ReplayAll()
+
+        result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                fake_properties)
+        self._verify_result(info, result, False)
+
+    def test_get_filtered_hosts_with_ignore_hosts_and_force_nodes(self):
+        # Ensure ignore_hosts can coexist with force_nodes
+        fake_properties = {'force_nodes': ['fake-node4', 'fake-node2'],
+                           'ignore_hosts': ['fake_host1', 'fake_host2']}
+
+        info = {'expected_objs': [self.fake_hosts[5], self.fake_hosts[7]],
+                'expected_fprops': fake_properties}
+        self._mock_get_filtered_hosts(info)
+
+        self.mox.ReplayAll()
+
+        result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                fake_properties)
+        self._verify_result(info, result, False)
+
+    def test_get_filtered_hosts_with_ignore_hosts_and_force_same_nodes(self):
+        # Ensure ignore_hosts is processed before force_nodes
+        fake_properties = {'force_nodes': ['fake_node4', 'fake_node2'],
+                           'ignore_hosts': ['fake_multihost']}
+
+        info = {'expected_objs': [],
+                'expected_fprops': fake_properties}
+        self._mock_get_filtered_hosts(info)
+
+        self.mox.ReplayAll()
+
+        result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                fake_properties)
+        self._verify_result(info, result, False)
 
     def test_update_service_capabilities(self):
         service_states = self.host_manager.service_states
-        self.assertDictMatch(service_states, {})
+        self.assertEqual(len(service_states.keys()), 0)
         self.mox.StubOutWithMock(timeutils, 'utcnow')
         timeutils.utcnow().AndReturn(31337)
-        timeutils.utcnow().AndReturn(31338)
         timeutils.utcnow().AndReturn(31339)
 
         host1_compute_capabs = dict(free_memory=1234, host_memory=5678,
-                timestamp=1)
-        host1_volume_capabs = dict(free_disk=4321, timestamp=1)
-        host2_compute_capabs = dict(free_memory=8756, timestamp=1)
+                timestamp=1, hypervisor_hostname='node1')
+        host2_compute_capabs = dict(free_memory=8756, timestamp=1,
+                hypervisor_hostname='node2')
 
         self.mox.ReplayAll()
         self.host_manager.update_service_capabilities('compute', 'host1',
                 host1_compute_capabs)
-        self.host_manager.update_service_capabilities('volume', 'host1',
-                host1_volume_capabs)
         self.host_manager.update_service_capabilities('compute', 'host2',
                 host2_compute_capabs)
 
-        # Make sure dictionary isn't re-assigned
-        self.assertEqual(self.host_manager.service_states, service_states)
         # Make sure original dictionary wasn't copied
         self.assertEqual(host1_compute_capabs['timestamp'], 1)
 
         host1_compute_capabs['timestamp'] = 31337
-        host1_volume_capabs['timestamp'] = 31338
         host2_compute_capabs['timestamp'] = 31339
 
-        expected = {'host1': {'compute': host1_compute_capabs,
-                              'volume': host1_volume_capabs},
-                    'host2': {'compute': host2_compute_capabs}}
-        self.assertDictMatch(service_states, expected)
+        expected = {('host1', 'node1'): host1_compute_capabs,
+                    ('host2', 'node2'): host2_compute_capabs}
+        self.assertThat(service_states, matchers.DictMatches(expected))
+
+    def test_update_service_capabilities_node_key(self):
+        service_states = self.host_manager.service_states
+        self.assertThat(service_states, matchers.DictMatches({}))
+
+        host1_cap = {'hypervisor_hostname': 'host1-hvhn'}
+        host2_cap = {}
+
+        timeutils.set_time_override(31337)
+        self.host_manager.update_service_capabilities('compute', 'host1',
+                host1_cap)
+        timeutils.set_time_override(31338)
+        self.host_manager.update_service_capabilities('compute', 'host2',
+                host2_cap)
+        host1_cap['timestamp'] = 31337
+        host2_cap['timestamp'] = 31338
+        expected = {('host1', 'host1-hvhn'): host1_cap,
+                    ('host2', None): host2_cap}
+        self.assertThat(service_states, matchers.DictMatches(expected))
 
     def test_get_all_host_states(self):
 
         context = 'fake_context'
-        topic = 'compute'
 
         self.mox.StubOutWithMock(db, 'compute_node_get_all')
         self.mox.StubOutWithMock(host_manager.LOG, 'warn')
@@ -136,119 +324,103 @@ class HostManagerTestCase(test.TestCase):
         host_manager.LOG.warn("No service for compute ID 5")
 
         self.mox.ReplayAll()
-        host_states = self.host_manager.get_all_host_states(context, topic)
+        self.host_manager.get_all_host_states(context)
+        host_states_map = self.host_manager.host_state_map
 
-        self.assertEqual(len(host_states), 4)
+        self.assertEqual(len(host_states_map), 4)
         # Check that .service is set properly
         for i in xrange(4):
             compute_node = fakes.COMPUTE_NODES[i]
             host = compute_node['service']['host']
-            self.assertEqual(host_states[host].service,
+            node = compute_node['hypervisor_hostname']
+            state_key = (host, node)
+            self.assertEqual(host_states_map[state_key].service,
                     compute_node['service'])
-        self.assertEqual(host_states['host1'].free_ram_mb, 512)
+        self.assertEqual(host_states_map[('host1', 'node1')].free_ram_mb,
+                         512)
         # 511GB
-        self.assertEqual(host_states['host1'].free_disk_mb, 524288)
-        self.assertEqual(host_states['host2'].free_ram_mb, 1024)
+        self.assertEqual(host_states_map[('host1', 'node1')].free_disk_mb,
+                         524288)
+        self.assertEqual(host_states_map[('host2', 'node2')].free_ram_mb,
+                         1024)
         # 1023GB
-        self.assertEqual(host_states['host2'].free_disk_mb, 1048576)
-        self.assertEqual(host_states['host3'].free_ram_mb, 3072)
+        self.assertEqual(host_states_map[('host2', 'node2')].free_disk_mb,
+                         1048576)
+        self.assertEqual(host_states_map[('host3', 'node3')].free_ram_mb,
+                         3072)
         # 3071GB
-        self.assertEqual(host_states['host3'].free_disk_mb, 3145728)
-        self.assertEqual(host_states['host4'].free_ram_mb, 8192)
+        self.assertEqual(host_states_map[('host3', 'node3')].free_disk_mb,
+                         3145728)
+        self.assertEqual(host_states_map[('host4', 'node4')].free_ram_mb,
+                         8192)
         # 8191GB
-        self.assertEqual(host_states['host4'].free_disk_mb, 8388608)
+        self.assertEqual(host_states_map[('host4', 'node4')].free_disk_mb,
+                         8388608)
 
 
-class HostStateTestCase(test.TestCase):
-    """Test case for HostState class"""
+class HostManagerChangedNodesTestCase(test.NoDBTestCase):
+    """Test case for HostManager class."""
+
+    def setUp(self):
+        super(HostManagerChangedNodesTestCase, self).setUp()
+        self.host_manager = host_manager.HostManager()
+        self.fake_hosts = [
+              host_manager.HostState('host1', 'node1'),
+              host_manager.HostState('host2', 'node2'),
+              host_manager.HostState('host3', 'node3'),
+              host_manager.HostState('host4', 'node4')
+            ]
+        self.addCleanup(timeutils.clear_time_override)
+
+    def test_get_all_host_states(self):
+        context = 'fake_context'
+
+        self.mox.StubOutWithMock(db, 'compute_node_get_all')
+        db.compute_node_get_all(context).AndReturn(fakes.COMPUTE_NODES)
+        self.mox.ReplayAll()
+
+        self.host_manager.get_all_host_states(context)
+        host_states_map = self.host_manager.host_state_map
+        self.assertEqual(len(host_states_map), 4)
+
+    def test_get_all_host_states_after_delete_one(self):
+        context = 'fake_context'
+
+        self.mox.StubOutWithMock(db, 'compute_node_get_all')
+        # all nodes active for first call
+        db.compute_node_get_all(context).AndReturn(fakes.COMPUTE_NODES)
+        # remove node4 for second call
+        running_nodes = [n for n in fakes.COMPUTE_NODES
+                         if n.get('hypervisor_hostname') != 'node4']
+        db.compute_node_get_all(context).AndReturn(running_nodes)
+        self.mox.ReplayAll()
+
+        self.host_manager.get_all_host_states(context)
+        self.host_manager.get_all_host_states(context)
+        host_states_map = self.host_manager.host_state_map
+        self.assertEqual(len(host_states_map), 3)
+
+    def test_get_all_host_states_after_delete_all(self):
+        context = 'fake_context'
+
+        self.mox.StubOutWithMock(db, 'compute_node_get_all')
+        # all nodes active for first call
+        db.compute_node_get_all(context).AndReturn(fakes.COMPUTE_NODES)
+        # remove all nodes for second call
+        db.compute_node_get_all(context).AndReturn([])
+        self.mox.ReplayAll()
+
+        self.host_manager.get_all_host_states(context)
+        self.host_manager.get_all_host_states(context)
+        host_states_map = self.host_manager.host_state_map
+        self.assertEqual(len(host_states_map), 0)
+
+
+class HostStateTestCase(test.NoDBTestCase):
+    """Test case for HostState class."""
 
     # update_from_compute_node() and consume_from_instance() are tested
     # in HostManagerTestCase.test_get_all_host_states()
-
-    def test_host_state_passes_filters_passes(self):
-        fake_host = host_manager.HostState('host1', 'compute')
-        filter_properties = {}
-
-        cls1 = ComputeFilterClass1()
-        cls2 = ComputeFilterClass2()
-        self.mox.StubOutWithMock(cls1, 'host_passes')
-        self.mox.StubOutWithMock(cls2, 'host_passes')
-        filter_fns = [cls1.host_passes, cls2.host_passes]
-
-        cls1.host_passes(fake_host, filter_properties).AndReturn(True)
-        cls2.host_passes(fake_host, filter_properties).AndReturn(True)
-
-        self.mox.ReplayAll()
-        result = fake_host.passes_filters(filter_fns, filter_properties)
-        self.assertTrue(result)
-
-    def test_host_state_passes_filters_passes_with_ignore(self):
-        fake_host = host_manager.HostState('host1', 'compute')
-        filter_properties = {'ignore_hosts': ['host2']}
-
-        cls1 = ComputeFilterClass1()
-        cls2 = ComputeFilterClass2()
-        self.mox.StubOutWithMock(cls1, 'host_passes')
-        self.mox.StubOutWithMock(cls2, 'host_passes')
-        filter_fns = [cls1.host_passes, cls2.host_passes]
-
-        cls1.host_passes(fake_host, filter_properties).AndReturn(True)
-        cls2.host_passes(fake_host, filter_properties).AndReturn(True)
-
-        self.mox.ReplayAll()
-        result = fake_host.passes_filters(filter_fns, filter_properties)
-        self.assertTrue(result)
-
-    def test_host_state_passes_filters_fails(self):
-        fake_host = host_manager.HostState('host1', 'compute')
-        filter_properties = {}
-
-        cls1 = ComputeFilterClass1()
-        cls2 = ComputeFilterClass2()
-        self.mox.StubOutWithMock(cls1, 'host_passes')
-        self.mox.StubOutWithMock(cls2, 'host_passes')
-        filter_fns = [cls1.host_passes, cls2.host_passes]
-
-        cls1.host_passes(fake_host, filter_properties).AndReturn(False)
-        # cls2.host_passes() not called because of short circuit
-
-        self.mox.ReplayAll()
-        result = fake_host.passes_filters(filter_fns, filter_properties)
-        self.assertFalse(result)
-
-    def test_host_state_passes_filters_fails_from_ignore(self):
-        fake_host = host_manager.HostState('host1', 'compute')
-        filter_properties = {'ignore_hosts': ['host1']}
-
-        cls1 = ComputeFilterClass1()
-        cls2 = ComputeFilterClass2()
-        self.mox.StubOutWithMock(cls1, 'host_passes')
-        self.mox.StubOutWithMock(cls2, 'host_passes')
-        filter_fns = [cls1.host_passes, cls2.host_passes]
-
-        # cls[12].host_passes() not called because of short circuit
-        # with matching host to ignore
-
-        self.mox.ReplayAll()
-        result = fake_host.passes_filters(filter_fns, filter_properties)
-        self.assertFalse(result)
-
-    def test_host_state_passes_filters_skipped_from_force(self):
-        fake_host = host_manager.HostState('host1', 'compute')
-        filter_properties = {'force_hosts': ['host1']}
-
-        cls1 = ComputeFilterClass1()
-        cls2 = ComputeFilterClass2()
-        self.mox.StubOutWithMock(cls1, 'host_passes')
-        self.mox.StubOutWithMock(cls2, 'host_passes')
-        filter_fns = [cls1.host_passes, cls2.host_passes]
-
-        # cls[12].host_passes() not called because of short circuit
-        # with matching host to force
-
-        self.mox.ReplayAll()
-        result = fake_host.passes_filters(filter_fns, filter_properties)
-        self.assertTrue(result)
 
     def test_stat_consumption_from_compute_node(self):
         stats = [
@@ -263,10 +435,16 @@ class HostStateTestCase(test.TestCase):
             dict(key='num_os_type_windoze', value='1'),
             dict(key='io_workload', value='42'),
         ]
-        compute = dict(stats=stats, memory_mb=0, free_disk_gb=0, local_gb=0,
-                       local_gb_used=0, free_ram_mb=0, vcpus=0, vcpus_used=0)
+        pci_labels = ['lab1', 'lab2', 'lab2', 'lab3']
+        pci_devices = []
+        for label in pci_labels:
+            pci_devices.append(fakes.create_fake_pci_device(label=label))
 
-        host = host_manager.HostState("fakehost", "faketopic")
+        compute = dict(stats=stats, memory_mb=0, free_disk_gb=0, local_gb=0,
+                       local_gb_used=0, free_ram_mb=0, vcpus=0, vcpus_used=0,
+                       updated_at=None, pci_devices=pci_devices)
+
+        host = host_manager.HostState("fakehost", "fakenode")
         host.update_from_compute_node(compute)
 
         self.assertEqual(5, host.num_instances)
@@ -279,17 +457,22 @@ class HostStateTestCase(test.TestCase):
         self.assertEqual(4, host.num_instances_by_os_type['linux'])
         self.assertEqual(1, host.num_instances_by_os_type['windoze'])
         self.assertEqual(42, host.num_io_ops)
+        self.assertEqual(sorted(pci_labels), sorted(host.free_pci_labels))
 
     def test_stat_consumption_from_instance(self):
-        host = host_manager.HostState("fakehost", "faketopic")
+        host = host_manager.HostState("fakehost", "fakenode")
+        host.free_pci_labels = ['lab1', 'lab2', 'lab2', 'lab3']
+        inst_type_specs = {'pci_passthrough:labels': '["lab1", "lab2"]'}
 
         instance = dict(root_gb=0, ephemeral_gb=0, memory_mb=0, vcpus=0,
                         project_id='12345', vm_state=vm_states.BUILDING,
+                        instance_type=dict(extra_specs=inst_type_specs),
                         task_state=task_states.SCHEDULING, os_type='Linux')
         host.consume_from_instance(instance)
 
         instance = dict(root_gb=0, ephemeral_gb=0, memory_mb=0, vcpus=0,
                         project_id='12345', vm_state=vm_states.PAUSED,
+                        instance_type=dict(extra_specs={}),
                         task_state=None, os_type='Linux')
         host.consume_from_instance(instance)
 
@@ -301,3 +484,5 @@ class HostStateTestCase(test.TestCase):
         self.assertEqual(1, host.task_states[None])
         self.assertEqual(2, host.num_instances_by_os_type['Linux'])
         self.assertEqual(1, host.num_io_ops)
+        self.assertEqual(sorted(['lab2', 'lab3']),
+                         sorted(host.free_pci_labels))

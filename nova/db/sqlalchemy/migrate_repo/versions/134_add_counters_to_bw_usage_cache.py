@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 OpenStack LLC.
+# Copyright 2012 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -16,10 +16,6 @@
 
 from sqlalchemy import Boolean, Column, DateTime, BigInteger
 from sqlalchemy import MetaData, Integer, String, Table
-
-from nova.openstack.common import log as logging
-
-LOG = logging.getLogger(__name__)
 
 
 def upgrade(migrate_engine):

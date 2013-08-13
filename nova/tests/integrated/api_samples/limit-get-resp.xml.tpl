@@ -12,6 +12,9 @@
     <rate regex=".*changes-since.*" uri="*changes-since*">
       <limit next-available="%(timestamp)s" unit="MINUTE" verb="GET" remaining="3" value="3"/>
     </rate>
+    <rate regex="^/os-fping" uri="*/os-fping">
+      <limit next-available="%(timestamp)s" unit="HOUR" verb="GET" remaining="12" value="12"/>
+    </rate>
   </rates>
   <absolute>
     <limit name="maxServerMeta" value="128"/>
@@ -21,11 +24,9 @@
     <limit name="maxPersonalitySize" value="10240"/>
     <limit name="maxSecurityGroupRules" value="20"/>
     <limit name="maxTotalKeypairs" value="100"/>
-    <limit name="maxTotalVolumes" value="10"/>
     <limit name="maxSecurityGroups" value="10"/>
     <limit name="maxTotalCores" value="20"/>
     <limit name="maxTotalFloatingIps" value="10"/>
-    <limit name="maxTotalVolumeGigabytes" value="1000"/>
     <limit name="maxTotalRAMSize" value="51200"/>
   </absolute>
 </limits>

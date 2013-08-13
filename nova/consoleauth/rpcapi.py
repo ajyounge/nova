@@ -18,11 +18,16 @@
 Client side of the consoleauth RPC API.
 """
 
-from nova import flags
+from oslo.config import cfg
+
 import nova.openstack.common.rpc.proxy
 
+CONF = cfg.CONF
 
-FLAGS = flags.FLAGS
+rpcapi_cap_opt = cfg.StrOpt('consoleauth',
+        default=None,
+        help='Set a version cap for messages sent to consoleauth services')
+CONF.register_opt(rpcapi_cap_opt, 'upgrade_levels')
 
 
 class ConsoleAuthAPI(nova.openstack.common.rpc.proxy.RpcProxy):
@@ -31,6 +36,13 @@ class ConsoleAuthAPI(nova.openstack.common.rpc.proxy.RpcProxy):
     API version history:
 
         1.0 - Initial version.
+        1.1 - Added get_backdoor_port()
+        1.2 - Added instance_uuid to authorize_console, and
+              delete_tokens_for_instance
+
+        ... Grizzly supports message version 1.2.  So, any changes to existing
+        methods in 2.x after that point should be done such that they can
+        handle the version_cap being set to 1.2.
     '''
 
     #
@@ -43,20 +55,35 @@ class ConsoleAuthAPI(nova.openstack.common.rpc.proxy.RpcProxy):
     #
     BASE_RPC_API_VERSION = '1.0'
 
+    VERSION_ALIASES = {
+        'grizzly': '1.2',
+    }
+
     def __init__(self):
+        version_cap = self.VERSION_ALIASES.get(CONF.upgrade_levels.consoleauth,
+                                               CONF.upgrade_levels.consoleauth)
         super(ConsoleAuthAPI, self).__init__(
-                topic=FLAGS.consoleauth_topic,
-                default_version=self.BASE_RPC_API_VERSION)
+                topic=CONF.consoleauth_topic,
+                default_version=self.BASE_RPC_API_VERSION,
+                version_cap=version_cap)
 
     def authorize_console(self, ctxt, token, console_type, host, port,
-                          internal_access_path):
+                          internal_access_path, instance_uuid=None):
         # The remote side doesn't return anything, but we want to block
         # until it completes.
         return self.call(ctxt,
                 self.make_msg('authorize_console',
                               token=token, console_type=console_type,
                               host=host, port=port,
-                              internal_access_path=internal_access_path))
+                              internal_access_path=internal_access_path,
+                              instance_uuid=instance_uuid),
+                version="1.2")
 
     def check_token(self, ctxt, token):
         return self.call(ctxt, self.make_msg('check_token', token=token))
+
+    def delete_tokens_for_instance(self, ctxt, instance_uuid):
+        return self.cast(ctxt,
+                self.make_msg('delete_tokens_for_instance',
+                              instance_uuid=instance_uuid),
+                version="1.2")

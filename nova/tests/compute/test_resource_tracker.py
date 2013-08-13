@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2012 OpenStack, LLC.
+# Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,49 +15,61 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""Tests for compute resource tracking"""
+"""Tests for compute resource tracking."""
 
 import uuid
 
+from oslo.config import cfg
+
+from nova.compute import flavors
 from nova.compute import resource_tracker
 from nova.compute import task_states
 from nova.compute import vm_states
+from nova import context
 from nova import db
-from nova import exception
-from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
 from nova import test
 from nova.virt import driver
 
-LOG = logging.getLogger(__name__)
 
-
-class FakeContext(object):
-    def __init__(self, is_admin=False):
-        self.is_admin = is_admin
-
-    def elevated(self):
-        return FakeContext(is_admin=True)
+FAKE_VIRT_MEMORY_MB = 5
+FAKE_VIRT_LOCAL_GB = 6
+FAKE_VIRT_VCPUS = 1
+CONF = cfg.CONF
 
 
 class UnsupportedVirtDriver(driver.ComputeDriver):
-    """Pretend version of a lame virt driver"""
-    def get_available_resource(self):
+    """Pretend version of a lame virt driver."""
+
+    def __init__(self):
+        super(UnsupportedVirtDriver, self).__init__(None)
+
+    def get_host_ip_addr(self):
+        return '127.0.0.1'
+
+    def get_available_resource(self, nodename):
         # no support for getting resource usage info
         return {}
+
+    def legacy_nwinfo(self):
+        return True
 
 
 class FakeVirtDriver(driver.ComputeDriver):
 
     def __init__(self):
-        self.memory_mb = 5
-        self.local_gb = 6
-        self.vcpus = 1
+        super(FakeVirtDriver, self).__init__(None)
+        self.memory_mb = FAKE_VIRT_MEMORY_MB
+        self.local_gb = FAKE_VIRT_LOCAL_GB
+        self.vcpus = FAKE_VIRT_VCPUS
 
         self.memory_mb_used = 0
         self.local_gb_used = 0
 
-    def get_available_resource(self):
+    def get_host_ip_addr(self):
+        return '127.0.0.1'
+
+    def get_available_resource(self, nodename):
         d = {
             'vcpus': self.vcpus,
             'memory_mb': self.memory_mb,
@@ -72,6 +84,9 @@ class FakeVirtDriver(driver.ComputeDriver):
         }
         return d
 
+    def legacy_nwinfo(self):
+        return True
+
 
 class BaseTestCase(test.TestCase):
 
@@ -81,11 +96,25 @@ class BaseTestCase(test.TestCase):
         self.flags(reserved_host_disk_mb=0,
                    reserved_host_memory_mb=0)
 
-        self.context = FakeContext()
+        self.context = context.get_admin_context()
 
-        self._instances = []
-        self.stubs.Set(db, 'instance_get_all_by_filters',
-                self._fake_instance_get_all_by_filters)
+        self.flags(use_local=True, group='conductor')
+        self.conductor = self.start_service('conductor',
+                                            manager=CONF.conductor.manager)
+
+        self._instances = {}
+        self._instance_types = {}
+
+        self.stubs.Set(self.conductor.db,
+                       'instance_get_all_by_host_and_node',
+                       self._fake_instance_get_all_by_host_and_node)
+        self.stubs.Set(self.conductor.db,
+                       'instance_update_and_get_original',
+                       self._fake_instance_update_and_get_original)
+        self.stubs.Set(self.conductor.db,
+                       'instance_type_get', self._fake_flavor_get)
+
+        self.host = 'fakehost'
 
     def _create_compute_node(self, values=None):
         compute = {
@@ -102,7 +131,8 @@ class BaseTestCase(test.TestCase):
             "current_workload": 1,
             "running_vms": 0,
             "cpu_info": None,
-            "stats": [{"key": "num_instances", "value": "1"}]
+            "stats": [{"key": "num_instances", "value": "1"}],
+           "hypervisor_hostname": "fakenode",
         }
         if values:
             compute.update(values)
@@ -121,10 +151,30 @@ class BaseTestCase(test.TestCase):
         }
         return service
 
-    def _fake_instance(self, *args, **kwargs):
+    def _fake_instance_system_metadata(self, instance_type, prefix=''):
+        sys_meta = []
+        for key in flavors.system_metadata_flavor_props.keys():
+            sys_meta.append({'key': '%sinstance_type_%s' % (prefix, key),
+                             'value': instance_type[key]})
+        return sys_meta
+
+    def _fake_instance(self, stash=True, **kwargs):
+
+        # Default to an instance ready to resize to or from the same
+        # instance_type
+        itype = self._fake_flavor_create()
+        sys_meta = self._fake_instance_system_metadata(itype)
+
+        if stash:
+            # stash instance types in system metadata.
+            sys_meta = (sys_meta +
+                        self._fake_instance_system_metadata(itype, 'new_') +
+                        self._fake_instance_system_metadata(itype, 'old_'))
+
+        instance_uuid = str(uuid.uuid1())
         instance = {
-            'uuid': str(uuid.uuid1()),
-            'vm_state': vm_states.BUILDING,
+            'uuid': instance_uuid,
+            'vm_state': vm_states.RESIZED,
             'task_state': None,
             'memory_mb': 2,
             'root_gb': 3,
@@ -133,24 +183,62 @@ class BaseTestCase(test.TestCase):
             'project_id': '123456',
             'vcpus': 1,
             'host': None,
+            'node': None,
+            'instance_type_id': 1,
+            'launched_on': None,
+            'system_metadata': sys_meta,
         }
         instance.update(kwargs)
 
-        self._instances.append(instance)
+        self._instances[instance_uuid] = instance
         return instance
 
-    def _fake_instance_get_all_by_filters(self, ctx, filters, **kwargs):
-        return self._instances
+    def _fake_flavor_create(self, **kwargs):
+        instance_type = {
+            'id': 1,
+            'name': 'fakeitype',
+            'memory_mb': FAKE_VIRT_MEMORY_MB,
+            'vcpus': FAKE_VIRT_VCPUS,
+            'root_gb': FAKE_VIRT_LOCAL_GB / 2,
+            'ephemeral_gb': FAKE_VIRT_LOCAL_GB / 2,
+            'swap': 0,
+            'rxtx_factor': 1.0,
+            'vcpu_weight': 1,
+            'flavorid': 'fakeflavor'
+        }
+        instance_type.update(**kwargs)
 
-    def _tracker(self, unsupported=False):
-        host = "fakehost"
+        id_ = instance_type['id']
+        self._instance_types[id_] = instance_type
+        return instance_type
 
-        if unsupported:
-            driver = UnsupportedVirtDriver()
-        else:
-            driver = FakeVirtDriver()
+    def _fake_instance_get_all_by_host_and_node(self, context, host, nodename):
+        return [i for i in self._instances.values() if i['host'] == host]
 
-        tracker = resource_tracker.ResourceTracker(host, driver)
+    def _fake_flavor_get(self, ctxt, id_):
+        return self._instance_types[id_]
+
+    def _fake_instance_update_and_get_original(self, context, instance_uuid,
+            values):
+        instance = self._instances[instance_uuid]
+        instance.update(values)
+        # the test doesn't care what the original instance values are, it's
+        # only used in the subsequent notification:
+        return (instance, instance)
+
+    def _driver(self):
+        return FakeVirtDriver()
+
+    def _tracker(self, host=None):
+
+        if host is None:
+            host = self.host
+
+        node = "fakenode"
+
+        driver = self._driver()
+
+        tracker = resource_tracker.ResourceTracker(host, driver, node)
         return tracker
 
 
@@ -160,54 +248,67 @@ class UnsupportedDriverTestCase(BaseTestCase):
     """
     def setUp(self):
         super(UnsupportedDriverTestCase, self).setUp()
-        self.tracker = self._tracker(unsupported=True)
+        self.tracker = self._tracker()
         # seed tracker with data:
         self.tracker.update_available_resource(self.context)
 
-    def testDisabled(self):
+    def _driver(self):
+        return UnsupportedVirtDriver()
+
+    def test_disabled(self):
         # disabled = no compute node stats
         self.assertTrue(self.tracker.disabled)
         self.assertEqual(None, self.tracker.compute_node)
 
-    def testDisabledClaim(self):
+    def test_disabled_claim(self):
         # basic claim:
-        claim = self.tracker.begin_resource_claim(self.context, 1, 1)
-        self.assertEqual(None, claim)
+        instance = self._fake_instance()
+        claim = self.tracker.instance_claim(self.context, instance)
+        self.assertEqual(0, claim.memory_mb)
 
-    def testDisabledInstanceClaim(self):
+    def test_disabled_instance_claim(self):
         # instance variation:
         instance = self._fake_instance()
-        claim = self.tracker.begin_resource_claim(self.context, instance)
-        self.assertEqual(None, claim)
+        claim = self.tracker.instance_claim(self.context, instance)
+        self.assertEqual(0, claim.memory_mb)
 
-    def testDisabledInstanceContextClaim(self):
+    def test_disabled_instance_context_claim(self):
         # instance context manager variation:
         instance = self._fake_instance()
-        with self.tracker.resource_claim(self.context, instance):
-            pass
-        self.assertEqual(0, len(self.tracker.claims))
+        claim = self.tracker.instance_claim(self.context, instance)
+        with self.tracker.instance_claim(self.context, instance) as claim:
+            self.assertEqual(0, claim.memory_mb)
 
-    def testDisabledFinishClaim(self):
-        self.assertEqual(None, self.tracker.finish_resource_claim(None))
-
-    def testDisabledAbortClaim(self):
-        self.assertEqual(None, self.tracker.abort_resource_claim(self.context,
-            None))
-
-    def testDisabledUpdateUsage(self):
+    def test_disabled_updated_usage(self):
         instance = self._fake_instance(host='fakehost', memory_mb=5,
                 root_gb=10)
         self.tracker.update_usage(self.context, instance)
+
+    def test_disabled_resize_claim(self):
+        instance = self._fake_instance()
+        instance_type = self._fake_flavor_create()
+        claim = self.tracker.resize_claim(self.context, instance,
+                instance_type)
+        self.assertEqual(0, claim.memory_mb)
+        self.assertEqual(instance['uuid'], claim.migration['instance_uuid'])
+        self.assertEqual(instance_type['id'],
+                claim.migration['new_instance_type_id'])
+
+    def test_disabled_resize_context_claim(self):
+        instance = self._fake_instance()
+        instance_type = self._fake_flavor_create()
+        with self.tracker.resize_claim(self.context, instance, instance_type) \
+                                       as claim:
+            self.assertEqual(0, claim.memory_mb)
 
 
 class MissingServiceTestCase(BaseTestCase):
     def setUp(self):
         super(MissingServiceTestCase, self).setUp()
-        self.context = FakeContext(is_admin=True)
+        self.context = context.get_admin_context()
         self.tracker = self._tracker()
 
-    def testMissingService(self):
-        """No service record in DB."""
+    def test_missing_service(self):
         self.tracker.update_available_resource(self.context)
         self.assertTrue(self.tracker.disabled)
 
@@ -217,8 +318,8 @@ class MissingComputeNodeTestCase(BaseTestCase):
         super(MissingComputeNodeTestCase, self).setUp()
         self.tracker = self._tracker()
 
-        self.stubs.Set(db, 'service_get_all_compute_by_host',
-                self._fake_service_get_all_compute_by_host)
+        self.stubs.Set(db, 'service_get_by_compute_host',
+                self._fake_service_get_by_compute_host)
         self.stubs.Set(db, 'compute_node_create',
                 self._fake_create_compute_node)
 
@@ -226,35 +327,51 @@ class MissingComputeNodeTestCase(BaseTestCase):
         self.created = True
         return self._create_compute_node()
 
-    def _fake_service_get_all_compute_by_host(self, ctx, host):
+    def _fake_service_get_by_compute_host(self, ctx, host):
         # return a service with no joined compute
         service = self._create_service()
-        return [service]
+        return service
 
-    def testCreatedComputeNode(self):
+    def test_create_compute_node(self):
         self.tracker.update_available_resource(self.context)
         self.assertTrue(self.created)
 
-    def testEnabled(self):
+    def test_enabled(self):
         self.tracker.update_available_resource(self.context)
         self.assertFalse(self.tracker.disabled)
 
 
-class ResourceTestCase(BaseTestCase):
+class BaseTrackerTestCase(BaseTestCase):
+
     def setUp(self):
-        super(ResourceTestCase, self).setUp()
+        # setup plumbing for a working resource tracker with required
+        # database models and a compatible compute driver:
+        super(BaseTrackerTestCase, self).setUp()
+
+        self.updated = False
+        self.deleted = False
+
         self.tracker = self._tracker()
-        self.stubs.Set(db, 'service_get_all_compute_by_host',
-                self._fake_service_get_all_compute_by_host)
+        self._migrations = {}
+
+        self.stubs.Set(db, 'service_get_by_compute_host',
+                self._fake_service_get_by_compute_host)
         self.stubs.Set(db, 'compute_node_update',
                 self._fake_compute_node_update)
+        self.stubs.Set(db, 'compute_node_delete',
+                self._fake_compute_node_delete)
+        self.stubs.Set(db, 'migration_update',
+                self._fake_migration_update)
+        self.stubs.Set(db, 'migration_get_in_progress_by_host_and_node',
+                self._fake_migration_get_in_progress_by_host_and_node)
 
         self.tracker.update_available_resource(self.context)
+        self.limits = self._limits()
 
-    def _fake_service_get_all_compute_by_host(self, ctx, host):
+    def _fake_service_get_by_compute_host(self, ctx, host):
         self.compute = self._create_compute_node()
         self.service = self._create_service(host, compute=self.compute)
-        return [self.service]
+        return self.service
 
     def _fake_compute_node_update(self, ctx, compute_node_id, values,
             prune_stats=False):
@@ -264,162 +381,118 @@ class ResourceTestCase(BaseTestCase):
         self.compute.update(values)
         return self.compute
 
-    def testUpdateUseOnlyForTracked(self):
-        """Only update usage is a previous claim has added instance to
-        list of tracked instances.
-        """
+    def _fake_compute_node_delete(self, ctx, compute_node_id):
+        self.deleted = True
+        self.compute.update({'deleted': 1})
+        return self.compute
+
+    def _fake_migration_get_in_progress_by_host_and_node(self, ctxt, host,
+                                                         node):
+        status = ['confirmed', 'reverted']
+        migrations = []
+
+        for migration in self._migrations.values():
+            if migration['status'] in status:
+                continue
+
+            uuid = migration['instance_uuid']
+            migration['instance'] = self._instances[uuid]
+            migrations.append(migration)
+
+        return migrations
+
+    def _fake_migration_update(self, ctxt, migration_id, values):
+        # cheat and assume there's only 1 migration present
+        migration = self._migrations.values()[0]
+        migration.update(values)
+        return migration
+
+    def _limits(self, memory_mb=FAKE_VIRT_MEMORY_MB,
+                disk_gb=FAKE_VIRT_LOCAL_GB, vcpus=FAKE_VIRT_VCPUS):
+        """Create limits dictionary used for oversubscribing resources."""
+
+        return {
+            'memory_mb': memory_mb,
+            'disk_gb': disk_gb,
+            'vcpu': vcpus
+        }
+
+    def _assert(self, value, field, tracker=None):
+
+        if tracker is None:
+            tracker = self.tracker
+
+        if field not in tracker.compute_node:
+            raise test.TestingException(
+                "'%(field)s' not in compute node." % locals())
+        x = tracker.compute_node[field]
+
+        self.assertEqual(value, x)
+
+
+class TrackerTestCase(BaseTrackerTestCase):
+
+    def test_free_ram_resource_value(self):
+        driver = FakeVirtDriver()
+        mem_free = driver.memory_mb - driver.memory_mb_used
+        self.assertEqual(mem_free, self.tracker.compute_node['free_ram_mb'])
+
+    def test_free_disk_resource_value(self):
+        driver = FakeVirtDriver()
+        mem_free = driver.local_gb - driver.local_gb_used
+        self.assertEqual(mem_free, self.tracker.compute_node['free_disk_gb'])
+
+    def test_update_compute_node(self):
+        self.assertFalse(self.tracker.disabled)
+        self.assertTrue(self.updated)
+
+    def test_init(self):
+        self._assert(FAKE_VIRT_MEMORY_MB, 'memory_mb')
+        self._assert(FAKE_VIRT_LOCAL_GB, 'local_gb')
+        self._assert(FAKE_VIRT_VCPUS, 'vcpus')
+        self._assert(0, 'memory_mb_used')
+        self._assert(0, 'local_gb_used')
+        self._assert(0, 'vcpus_used')
+        self._assert(0, 'running_vms')
+        self._assert(FAKE_VIRT_MEMORY_MB, 'free_ram_mb')
+        self._assert(FAKE_VIRT_LOCAL_GB, 'free_disk_gb')
+        self.assertFalse(self.tracker.disabled)
+        self.assertEqual(0, self.tracker.compute_node['current_workload'])
+
+
+class InstanceClaimTestCase(BaseTrackerTestCase):
+
+    def test_update_usage_only_for_tracked(self):
         instance = self._fake_instance(memory_mb=3, root_gb=1, ephemeral_gb=1,
                 task_state=None)
         self.tracker.update_usage(self.context, instance)
 
-        self.assertEqual(0, self.tracker.compute_node['memory_mb_used'])
-        self.assertEqual(0, self.tracker.compute_node['local_gb_used'])
-        self.assertEqual(0, self.tracker.compute_node['current_workload'])
+        self._assert(0, 'memory_mb_used')
+        self._assert(0, 'local_gb_used')
+        self._assert(0, 'current_workload')
 
-        claim = self.tracker.begin_resource_claim(self.context, instance)
-        self.assertNotEqual(None, claim)
-        self.assertEqual(3, self.tracker.compute_node['memory_mb_used'])
-        self.assertEqual(2, self.tracker.compute_node['local_gb_used'])
+        claim = self.tracker.instance_claim(self.context, instance,
+                self.limits)
+        self.assertNotEqual(0, claim.memory_mb)
+        self._assert(3, 'memory_mb_used')
+        self._assert(2, 'local_gb_used')
 
         # now update should actually take effect
         instance['task_state'] = task_states.SCHEDULING
         self.tracker.update_usage(self.context, instance)
 
-        self.assertEqual(3, self.tracker.compute_node['memory_mb_used'])
-        self.assertEqual(2, self.tracker.compute_node['local_gb_used'])
-        self.assertEqual(1, self.tracker.compute_node['current_workload'])
+        self._assert(3, 'memory_mb_used')
+        self._assert(2, 'local_gb_used')
+        self._assert(1, 'current_workload')
 
-    def testFreeRamResourceValue(self):
-        driver = FakeVirtDriver()
-        mem_free = driver.memory_mb - driver.memory_mb_used
-        self.assertEqual(mem_free, self.tracker.compute_node['free_ram_mb'])
-
-    def testFreeDiskResourceValue(self):
-        driver = FakeVirtDriver()
-        mem_free = driver.local_gb - driver.local_gb_used
-        self.assertEqual(mem_free, self.tracker.compute_node['free_disk_gb'])
-
-    def testUpdateComputeNode(self):
-        self.assertFalse(self.tracker.disabled)
-        self.assertTrue(self.updated)
-
-    def testCpuUnlimited(self):
-        """Test default of unlimited CPU"""
-        self.assertEqual(0, self.tracker.compute_node['vcpus_used'])
-        instance = self._fake_instance(memory_mb=1, root_gb=1, ephemeral_gb=1,
-                                       vcpus=100000)
-        claim = self.tracker.begin_resource_claim(self.context, instance)
-        self.assertNotEqual(None, claim)
-        self.assertEqual(100000, self.tracker.compute_node['vcpus_used'])
-
-    def testCpuOversubscription(self):
-        """Test client-supplied oversubscription of CPU"""
-        self.assertEqual(1, self.tracker.compute_node['vcpus'])
-
-        instance = self._fake_instance(memory_mb=1, root_gb=1, ephemeral_gb=1,
-                                       vcpus=3)
-        limits = {'vcpu': 5}
-        claim = self.tracker.begin_resource_claim(self.context, instance,
-                limits)
-        self.assertNotEqual(None, claim)
-        self.assertEqual(3, self.tracker.compute_node['vcpus_used'])
-
-    def testMemoryOversubscription(self):
-        """Test client-supplied oversubscription of memory"""
-        instance = self._fake_instance(memory_mb=8, root_gb=1, ephemeral_gb=1)
-        limits = {'memory_mb': 8}
-        claim = self.tracker.begin_resource_claim(self.context, instance,
-                limits)
-        self.assertNotEqual(None, claim)
-        self.assertEqual(8, self.tracker.compute_node['memory_mb_used'])
-        self.assertEqual(2, self.tracker.compute_node['local_gb_used'])
-
-    def testDiskOversubscription(self):
-        """Test client-supplied oversubscription of disk space"""
-        instance = self._fake_instance(memory_mb=1, root_gb=10, ephemeral_gb=1)
-        limits = {'disk_gb': 12}
-        claim = self.tracker.begin_resource_claim(self.context, instance,
-                limits)
-        self.assertNotEqual(None, claim)
-        self.assertEqual(1, self.tracker.compute_node['memory_mb_used'])
-        self.assertEqual(11, self.tracker.compute_node['local_gb_used'])
-
-    def testUnlimitedMemoryClaim(self):
-        """Test default of unlimited memory"""
-        instance = self._fake_instance(memory_mb=200000000000, root_gb=1,
-                                       ephemeral_gb=1)
-        claim = self.tracker.begin_resource_claim(self.context, instance)
-        self.assertNotEqual(None, claim)
-        self.assertEqual(200000000000,
-                         self.tracker.compute_node['memory_mb_used'])
-
-    def testInsufficientMemoryClaimWithOversubscription(self):
-        """Exceed oversubscribed memory limit of 10MB"""
-        instance = self._fake_instance(memory_mb=10, root_gb=0,
-                ephemeral_gb=0)
-        limits = {'memory_mb': 10}
-        claim = self.tracker.begin_resource_claim(self.context, instance,
-                limits)
-        self.assertNotEqual(None, claim)
-
-        instance = self._fake_instance(memory_mb=1, root_gb=0,
-                ephemeral_gb=0)
-        limits = {'memory_mb': 10}
-        claim = self.tracker.begin_resource_claim(self.context, instance,
-                limits)
-        self.assertEqual(None, claim)
-
-    def testUnlimitDiskClaim(self):
-        """Test default of unlimited disk space"""
-        instance = self._fake_instance(memory_mb=0, root_gb=200000000,
-                                       ephemeral_gb=0)
-        claim = self.tracker.begin_resource_claim(self.context, instance)
-        self.assertNotEqual(None, claim)
-        self.assertEqual(200000000, self.tracker.compute_node['local_gb_used'])
-
-    def testInsufficientDiskClaimWithOversubscription(self):
-        """Exceed oversubscribed disk limit of 10GB"""
-        instance = self._fake_instance(memory_mb=1, root_gb=4,
-                ephemeral_gb=5)  # 9 GB
-        limits = {'disk_gb': 10}
-        claim = self.tracker.begin_resource_claim(self.context, instance,
-                limits)
-        self.assertNotEqual(None, claim)
-
-        instance = self._fake_instance(memory_mb=1, root_gb=1,
-                ephemeral_gb=1)  # 2 GB
-        limits = {'disk_gb': 10}
-        claim = self.tracker.begin_resource_claim(self.context, instance,
-                limits)
-        self.assertEqual(None, claim)
-
-    def testInsufficientCpuClaim(self):
-        instance = self._fake_instance(memory_mb=0, root_gb=0,
-                ephemeral_gb=0, vcpus=1)
-        claim = self.tracker.begin_resource_claim(self.context, instance)
-        self.assertNotEqual(None, claim)
-        self.assertEqual(1, self.tracker.compute_node['vcpus_used'])
-
-        instance = self._fake_instance(memory_mb=0, root_gb=0,
-                ephemeral_gb=0, vcpus=1)
-
-        limits = {'vcpu': 1}
-        claim = self.tracker.begin_resource_claim(self.context, instance,
-                limits)
-        self.assertEqual(None, claim)
-
-    def testClaimAndFinish(self):
-        self.assertEqual(5, self.tracker.compute_node['memory_mb'])
-        self.assertEqual(0, self.tracker.compute_node['memory_mb_used'])
-
-        self.assertEqual(6, self.tracker.compute_node['local_gb'])
-        self.assertEqual(0, self.tracker.compute_node['local_gb_used'])
-
+    def test_claim_and_audit(self):
         claim_mem = 3
         claim_disk = 2
         instance = self._fake_instance(memory_mb=claim_mem, root_gb=claim_disk,
                 ephemeral_gb=0)
-        claim = self.tracker.begin_resource_claim(self.context, instance)
+
+        claim = self.tracker.instance_claim(self.context, instance,
+                self.limits)
 
         self.assertEqual(5, self.compute["memory_mb"])
         self.assertEqual(claim_mem, self.compute["memory_mb_used"])
@@ -445,98 +518,65 @@ class ResourceTestCase(BaseTestCase):
         self.assertEqual(claim_disk, self.compute['local_gb_used'])
         self.assertEqual(6 - claim_disk, self.compute['free_disk_gb'])
 
-        # Finally, finish the claimm and update from the virt layer again.
-        # Resource usage will be consistent again:
-        self.tracker.finish_resource_claim(claim)
-        self.tracker.update_available_resource(self.context)
-
-        self.assertEqual(claim_mem, self.compute['memory_mb_used'])
-        self.assertEqual(5 - claim_mem, self.compute['free_ram_mb'])
-
-        self.assertEqual(claim_disk, self.compute['local_gb_used'])
-        self.assertEqual(6 - claim_disk, self.compute['free_disk_gb'])
-
-    def testClaimAndAbort(self):
-        self.assertEqual(5, self.tracker.compute_node['memory_mb'])
-        self.assertEqual(0, self.tracker.compute_node['memory_mb_used'])
-
-        self.assertEqual(6, self.tracker.compute_node['local_gb'])
-        self.assertEqual(0, self.tracker.compute_node['local_gb_used'])
-
+    def test_claim_and_abort(self):
         claim_mem = 3
         claim_disk = 2
         instance = self._fake_instance(memory_mb=claim_mem,
                 root_gb=claim_disk, ephemeral_gb=0)
-        claim = self.tracker.begin_resource_claim(self.context, instance)
+        claim = self.tracker.instance_claim(self.context, instance,
+                self.limits)
         self.assertNotEqual(None, claim)
 
-        self.assertEqual(5, self.compute["memory_mb"])
         self.assertEqual(claim_mem, self.compute["memory_mb_used"])
         self.assertEqual(5 - claim_mem, self.compute["free_ram_mb"])
 
-        self.assertEqual(6, self.compute["local_gb"])
         self.assertEqual(claim_disk, self.compute["local_gb_used"])
         self.assertEqual(6 - claim_disk, self.compute["free_disk_gb"])
 
-        self.tracker.abort_resource_claim(self.context, claim)
+        claim.abort()
 
-        self.assertEqual(5, self.compute["memory_mb"])
         self.assertEqual(0, self.compute["memory_mb_used"])
         self.assertEqual(5, self.compute["free_ram_mb"])
 
-        self.assertEqual(6, self.compute["local_gb"])
         self.assertEqual(0, self.compute["local_gb_used"])
         self.assertEqual(6, self.compute["free_disk_gb"])
 
-    def testExpiredClaims(self):
-        """Test that old claims get cleaned up automatically if not finished
-        or aborted explicitly.
-        """
-        instance = self._fake_instance(memory_mb=2, root_gb=2, ephemeral_gb=0)
-        claim = self.tracker.begin_resource_claim(self.context, instance)
-        claim.expire_ts = timeutils.utcnow_ts() - 1
-        self.assertTrue(claim.is_expired())
+    def test_instance_claim_with_oversubscription(self):
+        memory_mb = FAKE_VIRT_MEMORY_MB * 2
+        root_gb = ephemeral_gb = FAKE_VIRT_LOCAL_GB
+        vcpus = FAKE_VIRT_VCPUS * 2
 
-        # and an unexpired claim
-        instance2 = self._fake_instance(memory_mb=1, root_gb=1, ephemeral_gb=0)
-        claim2 = self.tracker.begin_resource_claim(self.context, instance2)
+        limits = {'memory_mb': memory_mb, 'disk_gb': root_gb * 2,
+                  'vcpu': vcpus}
+        instance = self._fake_instance(memory_mb=memory_mb,
+                root_gb=root_gb, ephemeral_gb=ephemeral_gb)
 
-        self.assertEqual(2, len(self.tracker.claims))
-        self.assertEqual(2 + 1, self.tracker.compute_node['memory_mb_used'])
-        self.assertEqual(2 + 1, self.tracker.compute_node['local_gb_used'])
+        self.tracker.instance_claim(self.context, instance, limits)
+        self.assertEqual(memory_mb,
+                self.tracker.compute_node['memory_mb_used'])
+        self.assertEqual(root_gb * 2,
+                self.tracker.compute_node['local_gb_used'])
 
-        # expired claims get expunged when audit runs:
-        self.tracker.update_available_resource(self.context)
+    def test_additive_claims(self):
+        self.limits['vcpu'] = 2
 
-        self.assertEqual(1, len(self.tracker.claims))
-        self.assertEqual(2, len(self.tracker.tracked_instances))
+        instance = self._fake_instance(memory_mb=1, root_gb=1, ephemeral_gb=1,
+                vcpus=1)
+        with self.tracker.instance_claim(self.context, instance, self.limits):
+            pass
+        instance = self._fake_instance(memory_mb=1, root_gb=1, ephemeral_gb=1,
+                vcpus=1)
+        with self.tracker.instance_claim(self.context, instance, self.limits):
+            pass
 
-        # the expired claim's instance is assumed to still exist, so the
-        # resources should be counted:
-        self.assertEqual(2 + 1, self.tracker.compute_node['memory_mb_used'])
-        self.assertEqual(2 + 1, self.tracker.compute_node['local_gb_used'])
+        self.assertEqual(2, self.tracker.compute_node['memory_mb_used'])
+        self.assertEqual(4, self.tracker.compute_node['local_gb_used'])
+        self.assertEqual(2, self.tracker.compute_node['vcpus_used'])
 
-        # this abort should do nothing because the claim was purged due to
-        # expiration:
-        self.tracker.abort_resource_claim(self.context, claim)
-
-        # call finish on claim2:
-        self.tracker.finish_resource_claim(claim2)
-
-        # should have usage from both instances:
-        self.assertEqual(1 + 2, self.tracker.compute_node['memory_mb_used'])
-        self.assertEqual(1 + 2, self.tracker.compute_node['local_gb_used'])
-
-    def testInstanceClaim(self):
-        instance = self._fake_instance(memory_mb=1, root_gb=0, ephemeral_gb=2)
-        self.tracker.begin_resource_claim(self.context, instance)
-        self.assertEqual(1, self.tracker.compute_node['memory_mb_used'])
-        self.assertEqual(2, self.tracker.compute_node['local_gb_used'])
-
-    def testContextClaimWithException(self):
+    def test_context_claim_with_exception(self):
         instance = self._fake_instance(memory_mb=1, root_gb=1, ephemeral_gb=1)
         try:
-            with self.tracker.resource_claim(self.context, instance):
+            with self.tracker.instance_claim(self.context, instance):
                 # <insert exciting things that utilize resources>
                 raise test.TestingException()
         except test.TestingException:
@@ -547,9 +587,9 @@ class ResourceTestCase(BaseTestCase):
         self.assertEqual(0, self.compute['memory_mb_used'])
         self.assertEqual(0, self.compute['local_gb_used'])
 
-    def testInstanceContextClaim(self):
+    def test_instance_context_claim(self):
         instance = self._fake_instance(memory_mb=1, root_gb=1, ephemeral_gb=1)
-        with self.tracker.resource_claim(self.context, instance):
+        with self.tracker.instance_claim(self.context, instance):
             # <insert exciting things that utilize resources>
             self.assertEqual(1, self.tracker.compute_node['memory_mb_used'])
             self.assertEqual(2, self.tracker.compute_node['local_gb_used'])
@@ -564,12 +604,10 @@ class ResourceTestCase(BaseTestCase):
         self.assertEqual(1, self.compute['memory_mb_used'])
         self.assertEqual(2, self.compute['local_gb_used'])
 
-    def testUpdateLoadStatsForInstance(self):
-        self.assertFalse(self.tracker.disabled)
-        self.assertEqual(0, self.tracker.compute_node['current_workload'])
+    def test_update_load_stats_for_instance(self):
 
         instance = self._fake_instance(task_state=task_states.SCHEDULING)
-        with self.tracker.resource_claim(self.context, instance):
+        with self.tracker.instance_claim(self.context, instance):
             pass
 
         self.assertEqual(1, self.tracker.compute_node['current_workload'])
@@ -581,7 +619,7 @@ class ResourceTestCase(BaseTestCase):
         self.tracker.update_usage(self.context, instance)
         self.assertEqual(0, self.tracker.compute_node['current_workload'])
 
-    def testCpuStats(self):
+    def test_cpu_stats(self):
         limits = {'disk_gb': 100, 'memory_mb': 100}
         self.assertEqual(0, self.tracker.compute_node['vcpus_used'])
 
@@ -591,7 +629,7 @@ class ResourceTestCase(BaseTestCase):
         self.tracker.update_usage(self.context, instance)
         self.assertEqual(0, self.tracker.compute_node['vcpus_used'])
 
-        with self.tracker.resource_claim(self.context, instance, limits):
+        with self.tracker.instance_claim(self.context, instance, limits):
             pass
         self.assertEqual(1, self.tracker.compute_node['vcpus_used'])
 
@@ -601,10 +639,275 @@ class ResourceTestCase(BaseTestCase):
         self.assertEqual(1, self.tracker.compute_node['vcpus_used'])
 
         instance = self._fake_instance(vcpus=10)
-        with self.tracker.resource_claim(self.context, instance, limits):
+        with self.tracker.instance_claim(self.context, instance, limits):
             pass
         self.assertEqual(11, self.tracker.compute_node['vcpus_used'])
 
         instance['vm_state'] = vm_states.DELETED
         self.tracker.update_usage(self.context, instance)
         self.assertEqual(1, self.tracker.compute_node['vcpus_used'])
+
+    def test_skip_deleted_instances(self):
+        # ensure that the audit process skips instances that have vm_state
+        # DELETED, but the DB record is not yet deleted.
+        self._fake_instance(vm_state=vm_states.DELETED, host=self.host)
+        self.tracker.update_available_resource(self.context)
+
+        self.assertEqual(0, self.tracker.compute_node['memory_mb_used'])
+        self.assertEqual(0, self.tracker.compute_node['local_gb_used'])
+
+
+class ResizeClaimTestCase(BaseTrackerTestCase):
+
+    def setUp(self):
+        super(ResizeClaimTestCase, self).setUp()
+
+        self.stubs.Set(self.conductor.db,
+                       'migration_create', self._fake_migration_create)
+
+        self.instance = self._fake_instance()
+        self.instance_type = self._fake_flavor_create()
+
+    def _fake_migration_create(self, context, values=None):
+        instance_uuid = str(uuid.uuid1())
+        migration = {
+            'id': 1,
+            'source_compute': 'host1',
+            'source_node': 'fakenode',
+            'dest_compute': 'host2',
+            'dest_node': 'fakenode',
+            'dest_host': '127.0.0.1',
+            'old_instance_type_id': 1,
+            'new_instance_type_id': 2,
+            'instance_uuid': instance_uuid,
+            'status': 'pre-migrating',
+            'updated_at': timeutils.utcnow()
+        }
+        if values:
+            migration.update(values)
+
+        self._migrations[migration['instance_uuid']] = migration
+        return migration
+
+    def test_claim(self):
+        self.tracker.resize_claim(self.context, self.instance,
+                self.instance_type, self.limits)
+        self._assert(FAKE_VIRT_MEMORY_MB, 'memory_mb_used')
+        self._assert(FAKE_VIRT_LOCAL_GB, 'local_gb_used')
+        self._assert(FAKE_VIRT_VCPUS, 'vcpus_used')
+        self.assertEqual(1, len(self.tracker.tracked_migrations))
+
+    def test_abort(self):
+        try:
+            with self.tracker.resize_claim(self.context, self.instance,
+                    self.instance_type, self.limits):
+                raise test.TestingException("abort")
+        except test.TestingException:
+            pass
+
+        self._assert(0, 'memory_mb_used')
+        self._assert(0, 'local_gb_used')
+        self._assert(0, 'vcpus_used')
+        self.assertEqual(0, len(self.tracker.tracked_migrations))
+
+    def test_additive_claims(self):
+
+        limits = self._limits(FAKE_VIRT_MEMORY_MB * 2, FAKE_VIRT_LOCAL_GB * 2,
+                              FAKE_VIRT_VCPUS * 2)
+        self.tracker.resize_claim(self.context, self.instance,
+                self.instance_type, limits)
+        instance2 = self._fake_instance()
+        self.tracker.resize_claim(self.context, instance2, self.instance_type,
+                limits)
+
+        self._assert(2 * FAKE_VIRT_MEMORY_MB, 'memory_mb_used')
+        self._assert(2 * FAKE_VIRT_LOCAL_GB, 'local_gb_used')
+        self._assert(2 * FAKE_VIRT_VCPUS, 'vcpus_used')
+
+    def test_claim_and_audit(self):
+        self.tracker.resize_claim(self.context, self.instance,
+                self.instance_type, self.limits)
+
+        self.tracker.update_available_resource(self.context)
+
+        self._assert(FAKE_VIRT_MEMORY_MB, 'memory_mb_used')
+        self._assert(FAKE_VIRT_LOCAL_GB, 'local_gb_used')
+        self._assert(FAKE_VIRT_VCPUS, 'vcpus_used')
+
+    def test_same_host(self):
+        self.limits['vcpu'] = 3
+
+        src_type = self._fake_flavor_create(id=2, memory_mb=1,
+                root_gb=1, ephemeral_gb=0, vcpus=1)
+        dest_type = self._fake_flavor_create(id=2, memory_mb=2,
+                root_gb=2, ephemeral_gb=1, vcpus=2)
+
+        # make an instance of src_type:
+        instance = self._fake_instance(memory_mb=1, root_gb=1, ephemeral_gb=0,
+                vcpus=1, instance_type_id=2)
+        instance['system_metadata'] = self._fake_instance_system_metadata(
+            dest_type)
+        self.tracker.instance_claim(self.context, instance, self.limits)
+
+        # resize to dest_type:
+        claim = self.tracker.resize_claim(self.context, instance,
+                dest_type, self.limits)
+
+        self._assert(3, 'memory_mb_used')
+        self._assert(4, 'local_gb_used')
+        self._assert(3, 'vcpus_used')
+
+        self.tracker.update_available_resource(self.context)
+        claim.abort()
+
+        # only the original instance should remain, not the migration:
+        self._assert(1, 'memory_mb_used')
+        self._assert(1, 'local_gb_used')
+        self._assert(1, 'vcpus_used')
+        self.assertEqual(1, len(self.tracker.tracked_instances))
+        self.assertEqual(0, len(self.tracker.tracked_migrations))
+
+    def test_revert(self):
+        self.tracker.resize_claim(self.context, self.instance,
+                self.instance_type, self.limits)
+        self.tracker.drop_resize_claim(self.instance)
+
+        self.assertEqual(0, len(self.tracker.tracked_instances))
+        self.assertEqual(0, len(self.tracker.tracked_migrations))
+        self._assert(0, 'memory_mb_used')
+        self._assert(0, 'local_gb_used')
+        self._assert(0, 'vcpus_used')
+
+    def test_revert_reserve_source(self):
+        # if a revert has started at the API and audit runs on
+        # the source compute before the instance flips back to source,
+        # resources should still be held at the source based on the
+        # migration:
+        dest = "desthost"
+        dest_tracker = self._tracker(host=dest)
+        dest_tracker.update_available_resource(self.context)
+
+        self.instance = self._fake_instance(memory_mb=FAKE_VIRT_MEMORY_MB,
+                root_gb=FAKE_VIRT_LOCAL_GB, ephemeral_gb=0,
+                vcpus=FAKE_VIRT_VCPUS, instance_type_id=1)
+
+        values = {'source_compute': self.host, 'dest_compute': dest,
+                  'old_instance_type_id': 1, 'new_instance_type_id': 1,
+                  'status': 'post-migrating',
+                  'instance_uuid': self.instance['uuid']}
+        migration = self._fake_migration_create(self.context, values)
+
+        # attach an instance to the destination host tracker:
+        dest_tracker.instance_claim(self.context, self.instance)
+
+        self._assert(FAKE_VIRT_MEMORY_MB, 'memory_mb_used',
+                     tracker=dest_tracker)
+        self._assert(FAKE_VIRT_LOCAL_GB, 'local_gb_used',
+                     tracker=dest_tracker)
+        self._assert(FAKE_VIRT_VCPUS, 'vcpus_used',
+                     tracker=dest_tracker)
+
+        # audit and recheck to confirm migration doesn't get double counted
+        # on dest:
+        dest_tracker.update_available_resource(self.context)
+
+        self._assert(FAKE_VIRT_MEMORY_MB, 'memory_mb_used',
+                     tracker=dest_tracker)
+        self._assert(FAKE_VIRT_LOCAL_GB, 'local_gb_used',
+                     tracker=dest_tracker)
+        self._assert(FAKE_VIRT_VCPUS, 'vcpus_used',
+                     tracker=dest_tracker)
+
+        # apply the migration to the source host tracker:
+        self.tracker.update_available_resource(self.context)
+
+        self._assert(FAKE_VIRT_MEMORY_MB, 'memory_mb_used')
+        self._assert(FAKE_VIRT_LOCAL_GB, 'local_gb_used')
+        self._assert(FAKE_VIRT_VCPUS, 'vcpus_used')
+
+        # flag the instance and migration as reverting and re-audit:
+        self.instance['vm_state'] = vm_states.RESIZED
+        self.instance['task_state'] = task_states.RESIZE_REVERTING
+        self.tracker.update_available_resource(self.context)
+
+        self._assert(FAKE_VIRT_MEMORY_MB, 'memory_mb_used')
+        self._assert(FAKE_VIRT_LOCAL_GB, 'local_gb_used')
+        self._assert(FAKE_VIRT_VCPUS, 'vcpus_used')
+
+    def test_resize_filter(self):
+        instance = self._fake_instance(vm_state=vm_states.ACTIVE,
+                task_state=task_states.SUSPENDING)
+        self.assertFalse(self.tracker._instance_in_resize_state(instance))
+
+        instance = self._fake_instance(vm_state=vm_states.RESIZED,
+                task_state=task_states.SUSPENDING)
+        self.assertTrue(self.tracker._instance_in_resize_state(instance))
+
+        instance = self._fake_instance(vm_state=vm_states.ACTIVE,
+                task_state=task_states.RESIZE_MIGRATING)
+        self.assertTrue(self.tracker._instance_in_resize_state(instance))
+
+    def test_dupe_filter(self):
+        self._fake_flavor_create(id=2, memory_mb=1, root_gb=1,
+                ephemeral_gb=1, vcpus=1)
+
+        instance = self._fake_instance(host=self.host)
+
+        values = {'source_compute': self.host, 'dest_compute': self.host,
+                  'instance_uuid': instance['uuid'], 'new_instance_type_id': 2}
+        self._fake_migration_create(self.context, values)
+        self._fake_migration_create(self.context, values)
+
+        self.tracker.update_available_resource(self.context)
+        self.assertEqual(1, len(self.tracker.tracked_migrations))
+
+    def test_set_instance_host_and_node(self):
+        instance = self._fake_instance()
+        self.assertEqual(None, instance['host'])
+        self.assertEqual(None, instance['launched_on'])
+        self.assertEqual(None, instance['node'])
+
+        claim = self.tracker.instance_claim(self.context, instance)
+        self.assertNotEqual(0, claim.memory_mb)
+
+        self.assertEqual('fakehost', instance['host'])
+        self.assertEqual('fakehost', instance['launched_on'])
+        self.assertEqual('fakenode', instance['node'])
+
+
+class NoInstanceTypesInSysMetadata(ResizeClaimTestCase):
+    """Make sure we handle the case where the following are true:
+    1) Compute node C gets upgraded to code that looks for instance types in
+       system metadata. AND
+    2) C already has instances in the process of migrating that do not have
+       stashed instance types.
+
+    bug 1164110
+    """
+    def setUp(self):
+        super(NoInstanceTypesInSysMetadata, self).setUp()
+        self.instance = self._fake_instance(stash=False)
+
+
+class OrphanTestCase(BaseTrackerTestCase):
+    def _driver(self):
+        class OrphanVirtDriver(FakeVirtDriver):
+            def get_per_instance_usage(self):
+                return {
+                    '1-2-3-4-5': {'memory_mb': 4, 'uuid': '1-2-3-4-5'},
+                    '2-3-4-5-6': {'memory_mb': 4, 'uuid': '2-3-4-5-6'},
+
+                }
+
+        return OrphanVirtDriver()
+
+    def test_usage(self):
+        # 2 instances, 4 mb each
+        self.assertEqual(8, self.tracker.compute_node['memory_mb_used'])
+
+    def test_find(self):
+        # create one legit instance and verify the 2 orphans remain
+        self._fake_instance()
+        orphans = self.tracker._find_orphaned_instances()
+
+        self.assertEqual(2, len(orphans))

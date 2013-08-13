@@ -1,19 +1,24 @@
 {
     "server": {
         "OS-DCF:diskConfig": "AUTO",
+        "OS-EXT-AZ:availability_zone": "nova",
         "OS-EXT-SRV-ATTR:host": "%(compute_host)s",
-        "OS-EXT-SRV-ATTR:hypervisor_hostname": null,
+        "OS-EXT-SRV-ATTR:hypervisor_hostname": "%(hypervisor_hostname)s",
         "OS-EXT-SRV-ATTR:instance_name": "instance-00000001",
         "OS-EXT-STS:power_state": 1,
         "OS-EXT-STS:task_state": null,
         "OS-EXT-STS:vm_state": "active",
+        "OS-SRV-USG:launched_at": "%(timestamp)s",
+        "OS-SRV-USG:terminated_at": null,
         "accessIPv4": "",
         "accessIPv6": "",
         "addresses": {
             "private": [
                 {
+                    "OS-EXT-IPS:type": "fixed",
                     "addr": "%(ip)s",
-                    "version": 4
+                    "version": 4,
+                    "OS-EXT-IPS-MAC:mac_addr": "%(mac_addr)s"
                 }
             ]
         },

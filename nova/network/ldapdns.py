@@ -15,13 +15,14 @@
 import ldap
 import time
 
+from oslo.config import cfg
+
 from nova import exception
-from nova import flags
-from nova.openstack.common import cfg
+from nova.network import dns_driver
 from nova.openstack.common import log as logging
 from nova import utils
 
-
+CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
 ldap_dns_opts = [
@@ -33,7 +34,8 @@ ldap_dns_opts = [
                help='user for ldap DNS'),
     cfg.StrOpt('ldap_dns_password',
                default='password',
-               help='password for ldap DNS'),
+               help='password for ldap DNS',
+               secret=True),
     cfg.StrOpt('ldap_dns_soa_hostmaster',
                default='hostmaster@example.org',
                help='Hostmaster for ldap dns driver Statement of Authority'),
@@ -61,7 +63,7 @@ ldap_dns_opts = [
                     'Statement of Authority'),
     ]
 
-flags.FLAGS.register_opts(ldap_dns_opts)
+CONF.register_opts(ldap_dns_opts)
 
 
 # Importing ldap.modlist breaks the tests for some reason,
@@ -82,26 +84,29 @@ class DNSEntry(object):
 
     def __init__(self, ldap_object):
         """ldap_object is an instance of ldap.LDAPObject.
+
            It should already be initialized and bound before
-           getting passed in here."""
+           getting passed in here.
+        """
         self.lobj = ldap_object
         self.ldap_tuple = None
         self.qualified_domain = None
 
     @classmethod
     def _get_tuple_for_domain(cls, lobj, domain):
-        entry = lobj.search_s(flags.FLAGS.ldap_dns_base_dn, ldap.SCOPE_SUBTREE,
+        entry = lobj.search_s(CONF.ldap_dns_base_dn, ldap.SCOPE_SUBTREE,
                               '(associatedDomain=%s)' % utils.utf8(domain))
         if not entry:
             return None
         if len(entry) > 1:
-            LOG.warn("Found multiple matches for domain %s.\n%s" %
-                     (domain, entry))
+            LOG.warn(_("Found multiple matches for domain "
+                    "%(domain)s.\n%(entry)s") %
+                    (domain, entry))
         return entry[0]
 
     @classmethod
     def _get_all_domains(cls, lobj):
-        entries = lobj.search_s(flags.FLAGS.ldap_dns_base_dn,
+        entries = lobj.search_s(CONF.ldap_dns_base_dn,
                                 ldap.SCOPE_SUBTREE, '(sOARecord=*)')
         domains = []
         for entry in entries:
@@ -121,8 +126,10 @@ class DNSEntry(object):
         if name.endswith(z):
             dequalified = name[0:name.rfind(z)]
         else:
-            LOG.warn("Unable to dequalify.  %s is not in %s.\n" %
-                     (name, self.qualified_domain))
+            LOG.warn(_("Unable to dequalify.  %(name)s is not in "
+                       "%(domain)s.\n") %
+                     {'name': name,
+                      'domain': self.qualified_domain})
             dequalified = None
 
         return dequalified
@@ -142,13 +149,13 @@ class DomainEntry(DNSEntry):
     def _soa(cls):
         date = time.strftime('%Y%m%d%H%M%S')
         soa = '%s %s %s %s %s %s %s' % (
-                 flags.FLAGS.ldap_dns_servers[0],
-                 flags.FLAGS.ldap_dns_soa_hostmaster,
+                 CONF.ldap_dns_servers[0],
+                 CONF.ldap_dns_soa_hostmaster,
                  date,
-                 flags.FLAGS.ldap_dns_soa_refresh,
-                 flags.FLAGS.ldap_dns_soa_retry,
-                 flags.FLAGS.ldap_dns_soa_expiry,
-                 flags.FLAGS.ldap_dns_soa_minimum)
+                 CONF.ldap_dns_soa_refresh,
+                 CONF.ldap_dns_soa_retry,
+                 CONF.ldap_dns_soa_expiry,
+                 CONF.ldap_dns_soa_minimum)
         return utils.utf8(soa)
 
     @classmethod
@@ -158,7 +165,7 @@ class DomainEntry(DNSEntry):
         if entry:
             raise exception.FloatingIpDNSExists(name=domain, domain='')
 
-        newdn = 'dc=%s,%s' % (domain, flags.FLAGS.ldap_dns_base_dn)
+        newdn = 'dc=%s,%s' % (domain, CONF.ldap_dns_base_dn)
         attrs = {'objectClass': ['domainrelatedobject', 'dnsdomain',
                                  'domain', 'dcobject', 'top'],
                  'sOARecord': [cls._soa()],
@@ -298,16 +305,17 @@ class HostEntry(DNSEntry):
     parent = property(_parent)
 
 
-class LdapDNS(object):
+class LdapDNS(dns_driver.DNSDriver):
     """Driver for PowerDNS using ldap as a back end.
 
        This driver assumes ldap-method=strict, with all domains
-       in the top-level, aRecords only."""
+       in the top-level, aRecords only.
+    """
 
     def __init__(self):
-        self.lobj = ldap.initialize(flags.FLAGS.ldap_dns_url)
-        self.lobj.simple_bind_s(flags.FLAGS.ldap_dns_user,
-                                flags.FLAGS.ldap_dns_password)
+        self.lobj = ldap.initialize(CONF.ldap_dns_url)
+        self.lobj.simple_bind_s(CONF.ldap_dns_user,
+                                CONF.ldap_dns_password)
 
     def get_domains(self):
         return DomainEntry._get_all_domains(self.lobj)
@@ -357,5 +365,5 @@ class LdapDNS(object):
         dEntry.delete()
 
     def delete_dns_file(self):
-        LOG.warn("This shouldn't be getting called except during testing.")
+        LOG.warn(_("This shouldn't be getting called except during testing."))
         pass

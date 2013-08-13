@@ -1,4 +1,4 @@
-# Copyright (c) 2012 OpenStack, LLC.
+# Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -13,33 +13,35 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import operator
+from oslo.config import cfg
 
 from nova.openstack.common import log as logging
 from nova.scheduler import filters
-from nova import utils
+from nova import servicegroup
 
+CONF = cfg.CONF
 
 LOG = logging.getLogger(__name__)
 
 
 class ComputeFilter(filters.BaseHostFilter):
-    """Filter on active Compute nodes"""
+    """Filter on active Compute nodes."""
+
+    def __init__(self):
+        self.servicegroup_api = servicegroup.API()
 
     def host_passes(self, host_state, filter_properties):
-        """Returns True for only active compute nodes"""
-        instance_type = filter_properties.get('instance_type')
-        if host_state.topic != 'compute' or not instance_type:
-            return True
+        """Returns True for only active compute nodes."""
         capabilities = host_state.capabilities
         service = host_state.service
 
-        if not utils.service_is_up(service) or service['disabled']:
+        alive = self.servicegroup_api.service_is_up(service)
+        if not alive or service['disabled']:
             LOG.debug(_("%(host_state)s is disabled or has not been "
-                    "heard from in a while"), locals())
+                    "heard from in a while"), {'host_state': host_state})
             return False
         if not capabilities.get("enabled", True):
             LOG.debug(_("%(host_state)s is disabled via capabilities"),
-                    locals())
+                    {'host_state': host_state})
             return False
         return True

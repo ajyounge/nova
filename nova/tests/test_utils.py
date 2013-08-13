@@ -16,114 +16,26 @@
 
 import __builtin__
 import datetime
+import functools
 import hashlib
+import importlib
 import os
 import os.path
 import StringIO
 import tempfile
 
-import eventlet
-from eventlet import greenpool
 import mox
+import netaddr
+from oslo.config import cfg
 
 import nova
 from nova import exception
-from nova import flags
+from nova.openstack.common import processutils
 from nova.openstack.common import timeutils
 from nova import test
 from nova import utils
 
-
-FLAGS = flags.FLAGS
-
-
-class ExecuteTestCase(test.TestCase):
-    def test_retry_on_failure(self):
-        fd, tmpfilename = tempfile.mkstemp()
-        _, tmpfilename2 = tempfile.mkstemp()
-        try:
-            fp = os.fdopen(fd, 'w+')
-            fp.write('''#!/bin/sh
-# If stdin fails to get passed during one of the runs, make a note.
-if ! grep -q foo
-then
-    echo 'failure' > "$1"
-fi
-# If stdin has failed to get passed during this or a previous run, exit early.
-if grep failure "$1"
-then
-    exit 1
-fi
-runs="$(cat $1)"
-if [ -z "$runs" ]
-then
-    runs=0
-fi
-runs=$(($runs + 1))
-echo $runs > "$1"
-exit 1
-''')
-            fp.close()
-            os.chmod(tmpfilename, 0755)
-            self.assertRaises(exception.ProcessExecutionError,
-                              utils.execute,
-                              tmpfilename, tmpfilename2, attempts=10,
-                              process_input='foo',
-                              delay_on_retry=False)
-            fp = open(tmpfilename2, 'r')
-            runs = fp.read()
-            fp.close()
-            self.assertNotEquals(runs.strip(), 'failure', 'stdin did not '
-                                                          'always get passed '
-                                                          'correctly')
-            runs = int(runs.strip())
-            self.assertEquals(runs, 10,
-                              'Ran %d times instead of 10.' % (runs,))
-        finally:
-            os.unlink(tmpfilename)
-            os.unlink(tmpfilename2)
-
-    def test_unknown_kwargs_raises_error(self):
-        self.assertRaises(exception.NovaException,
-                          utils.execute,
-                          '/usr/bin/env', 'true',
-                          this_is_not_a_valid_kwarg=True)
-
-    def test_check_exit_code_boolean(self):
-        utils.execute('/usr/bin/env', 'false', check_exit_code=False)
-        self.assertRaises(exception.ProcessExecutionError,
-                          utils.execute,
-                          '/usr/bin/env', 'false', check_exit_code=True)
-
-    def test_check_exit_code_boolean(self):
-
-        utils.execute('/bin/false', check_exit_code=False)
-        self.assertRaises(exception.ProcessExecutionError,
-                          utils.execute,
-                          '/bin/false', check_exit_code=True)
-
-    def test_no_retry_on_success(self):
-        fd, tmpfilename = tempfile.mkstemp()
-        _, tmpfilename2 = tempfile.mkstemp()
-        try:
-            fp = os.fdopen(fd, 'w+')
-            fp.write('''#!/bin/sh
-# If we've already run, bail out.
-grep -q foo "$1" && exit 1
-# Mark that we've run before.
-echo foo > "$1"
-# Check that stdin gets passed correctly.
-grep foo
-''')
-            fp.close()
-            os.chmod(tmpfilename, 0755)
-            utils.execute(tmpfilename,
-                          tmpfilename2,
-                          process_input='foo',
-                          attempts=2)
-        finally:
-            os.unlink(tmpfilename)
-            os.unlink(tmpfilename2)
+CONF = cfg.CONF
 
 
 class GetFromPathTestCase(test.TestCase):
@@ -281,6 +193,92 @@ class GetFromPathTestCase(test.TestCase):
         self.assertEquals(['b_1'], f(input, "a/b"))
 
 
+class GetMyIP4AddressTestCase(test.TestCase):
+    def test_get_my_ipv4_address_with_no_ipv4(self):
+        response = """172.16.0.0/16 via 172.16.251.13 dev tun1
+172.16.251.1 via 172.16.251.13 dev tun1
+172.16.251.13 dev tun1  proto kernel  scope link  src 172.16.251.14
+172.24.0.0/16 via 172.16.251.13 dev tun1
+192.168.122.0/24 dev virbr0  proto kernel  scope link  src 192.168.122.1"""
+
+        def fake_execute(*args, **kwargs):
+            return response, None
+
+        self.stubs.Set(utils, 'execute', fake_execute)
+        address = utils.get_my_ipv4_address()
+        self.assertEqual(address, '127.0.0.1')
+
+    def test_get_my_ipv4_address_bad_process(self):
+        def fake_execute(*args, **kwargs):
+            raise processutils.ProcessExecutionError()
+
+        self.stubs.Set(utils, 'execute', fake_execute)
+        address = utils.get_my_ipv4_address()
+        self.assertEqual(address, '127.0.0.1')
+
+    def test_get_my_ipv4_address_with_single_interface(self):
+        response_route = """default via 192.168.1.1 dev wlan0  proto static
+192.168.1.0/24 dev wlan0  proto kernel  scope link  src 192.168.1.137  metric 9
+"""
+        response_addr = """
+1: lo    inet 127.0.0.1/8 scope host lo
+3: wlan0    inet 192.168.1.137/24 brd 192.168.1.255 scope global wlan0
+"""
+
+        def fake_execute(*args, **kwargs):
+            if 'route' in args:
+                return response_route, None
+            return response_addr, None
+
+        self.stubs.Set(utils, 'execute', fake_execute)
+        address = utils.get_my_ipv4_address()
+        self.assertEqual(address, '192.168.1.137')
+
+    def test_get_my_ipv4_address_with_multi_ipv4_on_single_interface(self):
+        response_route = """
+172.18.56.0/24 dev customer  proto kernel  scope link  src 172.18.56.22
+169.254.0.0/16 dev customer  scope link  metric 1031
+default via 172.18.56.1 dev customer
+"""
+        response_addr = (""
+"31: customer    inet 172.18.56.22/24 brd 172.18.56.255 scope global"
+" customer\n"
+"31: customer    inet 172.18.56.32/24 brd 172.18.56.255 scope global "
+"secondary customer")
+
+        def fake_execute(*args, **kwargs):
+            if 'route' in args:
+                return response_route, None
+            return response_addr, None
+
+        self.stubs.Set(utils, 'execute', fake_execute)
+        address = utils.get_my_ipv4_address()
+        self.assertEqual(address, '172.18.56.22')
+
+    def test_get_my_ipv4_address_with_multiple_interfaces(self):
+        response_route = """
+169.1.9.0/24 dev eth1  proto kernel  scope link  src 169.1.9.10
+172.17.248.0/21 dev eth0  proto kernel  scope link  src 172.17.255.9
+169.254.0.0/16 dev eth0  scope link  metric 1002
+169.254.0.0/16 dev eth1  scope link  metric 1003
+default via 172.17.248.1 dev eth0  proto static
+"""
+        response_addr = """
+1: lo    inet 127.0.0.1/8 scope host lo
+2: eth0    inet 172.17.255.9/21 brd 172.17.255.255 scope global eth0
+3: eth1    inet 169.1.9.10/24 scope global eth1
+"""
+
+        def fake_execute(*args, **kwargs):
+            if 'route' in args:
+                return response_route, None
+            return response_addr, None
+
+        self.stubs.Set(utils, 'execute', fake_execute)
+        address = utils.get_my_ipv4_address()
+        self.assertEqual(address, '172.17.255.9')
+
+
 class GenericUtilsTestCase(test.TestCase):
     def test_parse_server_string(self):
         result = utils.parse_server_string('::1')
@@ -328,33 +326,6 @@ class GenericUtilsTestCase(test.TestCase):
     def test_hostname_translate(self):
         hostname = "<}\x1fh\x10e\x08l\x02l\x05o\x12!{>"
         self.assertEqual("hello", utils.sanitize_hostname(hostname))
-
-    def test_bool_from_str(self):
-        self.assertTrue(utils.bool_from_str('1'))
-        self.assertTrue(utils.bool_from_str('2'))
-        self.assertTrue(utils.bool_from_str('-1'))
-        self.assertTrue(utils.bool_from_str('true'))
-        self.assertTrue(utils.bool_from_str('True'))
-        self.assertTrue(utils.bool_from_str('tRuE'))
-        self.assertTrue(utils.bool_from_str('yes'))
-        self.assertTrue(utils.bool_from_str('Yes'))
-        self.assertTrue(utils.bool_from_str('YeS'))
-        self.assertTrue(utils.bool_from_str('y'))
-        self.assertTrue(utils.bool_from_str('Y'))
-        self.assertFalse(utils.bool_from_str('False'))
-        self.assertFalse(utils.bool_from_str('false'))
-        self.assertFalse(utils.bool_from_str('no'))
-        self.assertFalse(utils.bool_from_str('No'))
-        self.assertFalse(utils.bool_from_str('n'))
-        self.assertFalse(utils.bool_from_str('N'))
-        self.assertFalse(utils.bool_from_str('0'))
-        self.assertFalse(utils.bool_from_str(None))
-        self.assertFalse(utils.bool_from_str('junk'))
-
-    def test_generate_glance_url(self):
-        generated_url = utils.generate_glance_url()
-        actual_url = "http://%s:%d" % (FLAGS.glance_host, FLAGS.glance_port)
-        self.assertEqual(generated_url, actual_url)
 
     def test_read_cached_file(self):
         self.mox.StubOutWithMock(os.path, "getmtime")
@@ -405,7 +376,7 @@ class GenericUtilsTestCase(test.TestCase):
     def test_read_file_as_root(self):
         def fake_execute(*args, **kwargs):
             if args[1] == 'bad':
-                raise exception.ProcessExecutionError
+                raise processutils.ProcessExecutionError()
             return 'fakecontents', None
 
         self.stubs.Set(utils, 'execute', fake_execute)
@@ -413,11 +384,6 @@ class GenericUtilsTestCase(test.TestCase):
         self.assertEqual(contents, 'fakecontents')
         self.assertRaises(exception.FileNotFound,
                           utils.read_file_as_root, 'bad')
-
-    def test_strcmp_const_time(self):
-        self.assertTrue(utils.strcmp_const_time('abc123', 'abc123'))
-        self.assertFalse(utils.strcmp_const_time('a', 'aaaaa'))
-        self.assertFalse(utils.strcmp_const_time('ABC123', 'abc123'))
 
     def test_temporary_chown(self):
         def fake_execute(*args, **kwargs):
@@ -429,40 +395,6 @@ class GenericUtilsTestCase(test.TestCase):
             with utils.temporary_chown(f.name, owner_uid=2):
                 self.assertEqual(fake_execute.uid, 2)
             self.assertEqual(fake_execute.uid, os.getuid())
-
-    def test_service_is_up(self):
-        fts_func = datetime.datetime.fromtimestamp
-        fake_now = 1000
-        down_time = 5
-
-        self.flags(service_down_time=down_time)
-        self.mox.StubOutWithMock(timeutils, 'utcnow')
-
-        # Up (equal)
-        timeutils.utcnow().AndReturn(fts_func(fake_now))
-        service = {'updated_at': fts_func(fake_now - down_time),
-                   'created_at': fts_func(fake_now - down_time)}
-        self.mox.ReplayAll()
-        result = utils.service_is_up(service)
-        self.assertTrue(result)
-
-        self.mox.ResetAll()
-        # Up
-        timeutils.utcnow().AndReturn(fts_func(fake_now))
-        service = {'updated_at': fts_func(fake_now - down_time + 1),
-                   'created_at': fts_func(fake_now - down_time + 1)}
-        self.mox.ReplayAll()
-        result = utils.service_is_up(service)
-        self.assertTrue(result)
-
-        self.mox.ResetAll()
-        # Down
-        timeutils.utcnow().AndReturn(fts_func(fake_now))
-        service = {'updated_at': fts_func(fake_now - down_time - 1),
-                   'created_at': fts_func(fake_now - down_time - 1)}
-        self.mox.ReplayAll()
-        result = utils.service_is_up(service)
-        self.assertFalse(result)
 
     def test_xhtml_escape(self):
         self.assertEqual('&quot;foo&quot;', utils.xhtml_escape('"foo"'))
@@ -479,30 +411,60 @@ class GenericUtilsTestCase(test.TestCase):
         h2 = hashlib.sha1(data).hexdigest()
         self.assertEquals(h1, h2)
 
+    def test_is_valid_ipv4(self):
+        self.assertTrue(utils.is_valid_ipv4('127.0.0.1'))
+        self.assertFalse(utils.is_valid_ipv4('::1'))
+        self.assertFalse(utils.is_valid_ipv4('bacon'))
+        self.assertFalse(utils.is_valid_ipv4(""))
+        self.assertFalse(utils.is_valid_ipv4(10))
 
-class IsUUIDLikeTestCase(test.TestCase):
-    def assertUUIDLike(self, val, expected):
-        result = utils.is_uuid_like(val)
-        self.assertEqual(result, expected)
+    def test_is_valid_ipv6(self):
+        self.assertTrue(utils.is_valid_ipv6("::1"))
+        self.assertTrue(utils.is_valid_ipv6(
+                            "abcd:ef01:2345:6789:abcd:ef01:192.168.254.254"))
+        self.assertTrue(utils.is_valid_ipv6(
+                                    "0000:0000:0000:0000:0000:0000:0000:0001"))
+        self.assertFalse(utils.is_valid_ipv6("foo"))
+        self.assertFalse(utils.is_valid_ipv6("127.0.0.1"))
+        self.assertFalse(utils.is_valid_ipv6(""))
+        self.assertFalse(utils.is_valid_ipv6(10))
 
-    def test_good_uuid(self):
-        val = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
-        self.assertUUIDLike(val, True)
+    def test_is_valid_ipv6_cidr(self):
+        self.assertTrue(utils.is_valid_ipv6_cidr("2600::/64"))
+        self.assertTrue(utils.is_valid_ipv6_cidr(
+                "abcd:ef01:2345:6789:abcd:ef01:192.168.254.254/48"))
+        self.assertTrue(utils.is_valid_ipv6_cidr(
+                "0000:0000:0000:0000:0000:0000:0000:0001/32"))
+        self.assertTrue(utils.is_valid_ipv6_cidr(
+                "0000:0000:0000:0000:0000:0000:0000:0001"))
+        self.assertFalse(utils.is_valid_ipv6_cidr("foo"))
+        self.assertFalse(utils.is_valid_ipv6_cidr("127.0.0.1"))
 
-    def test_integer_passed(self):
-        val = 1
-        self.assertUUIDLike(val, False)
+    def test_get_shortened_ipv6(self):
+        self.assertEquals("abcd:ef01:2345:6789:abcd:ef01:c0a8:fefe",
+                          utils.get_shortened_ipv6(
+                            "abcd:ef01:2345:6789:abcd:ef01:192.168.254.254"))
+        self.assertEquals("::1", utils.get_shortened_ipv6(
+                                    "0000:0000:0000:0000:0000:0000:0000:0001"))
+        self.assertEquals("caca::caca:0:babe:201:102",
+                          utils.get_shortened_ipv6(
+                                    "caca:0000:0000:caca:0000:babe:0201:0102"))
+        self.assertRaises(netaddr.AddrFormatError, utils.get_shortened_ipv6,
+                          "127.0.0.1")
+        self.assertRaises(netaddr.AddrFormatError, utils.get_shortened_ipv6,
+                          "failure")
 
-    def test_non_uuid_string_passed(self):
-        val = 'foo-fooo'
-        self.assertUUIDLike(val, False)
-
-    def test_non_uuid_string_passed2(self):
-        val = 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-        self.assertUUIDLike(val, False)
-
-    def test_gen_valid_uuid(self):
-        self.assertUUIDLike(str(utils.gen_uuid()), True)
+    def test_get_shortened_ipv6_cidr(self):
+        self.assertEquals("2600::/64", utils.get_shortened_ipv6_cidr(
+                "2600:0000:0000:0000:0000:0000:0000:0000/64"))
+        self.assertEquals("2600::/64", utils.get_shortened_ipv6_cidr(
+                "2600::1/64"))
+        self.assertRaises(netaddr.AddrFormatError,
+                          utils.get_shortened_ipv6_cidr,
+                          "127.0.0.1")
+        self.assertRaises(netaddr.AddrFormatError,
+                          utils.get_shortened_ipv6_cidr,
+                          "failure")
 
 
 class MonkeyPatchTestCase(test.TestCase):
@@ -550,33 +512,27 @@ class MonkeyPatchTestCase(test.TestCase):
             in nova.tests.monkey_patch_example.CALLED_FUNCTION)
 
 
-class TestFileLocks(test.TestCase):
-    def test_concurrent_green_lock_succeeds(self):
-        """Verify spawn_n greenthreads with two locks run concurrently."""
-        self.completed = False
-        with utils.tempdir() as tmpdir:
+class MonkeyPatchDefaultTestCase(test.TestCase):
+    """Unit test for default monkey_patch_modules value."""
 
-            def locka(wait):
-                a = utils.InterProcessLock(os.path.join(tmpdir, 'a'))
-                with a:
-                    wait.wait()
-                self.completed = True
+    def setUp(self):
+        super(MonkeyPatchDefaultTestCase, self).setUp()
+        self.flags(
+            monkey_patch=True)
 
-            def lockb(wait):
-                b = utils.InterProcessLock(os.path.join(tmpdir, 'b'))
-                with b:
-                    wait.wait()
-
-            wait1 = eventlet.event.Event()
-            wait2 = eventlet.event.Event()
-            pool = greenpool.GreenPool()
-            pool.spawn_n(locka, wait1)
-            pool.spawn_n(lockb, wait2)
-            wait2.send()
-            eventlet.sleep(0)
-            wait1.send()
-            pool.waitall()
-        self.assertTrue(self.completed)
+    def test_monkey_patch_default_mod(self):
+        # monkey_patch_modules is defined to be
+        #    <module_to_patch>:<decorator_to_patch_with>
+        #  Here we check that both parts of the default values are
+        # valid
+        for module in CONF.monkey_patch_modules:
+            m = module.split(':', 1)
+            # Check we can import the module to be patched
+            importlib.import_module(m[0])
+            # check the decorator is valid
+            decorator_name = m[1].rsplit('.', 1)
+            decorator_module = importlib.import_module(decorator_name[0])
+            getattr(decorator_module, decorator_name[1])
 
 
 class AuditPeriodTest(test.TestCase):
@@ -744,7 +700,7 @@ class AuditPeriodTest(test.TestCase):
 
 
 class DiffDict(test.TestCase):
-    """Unit tests for diff_dict()"""
+    """Unit tests for diff_dict()."""
 
     def test_no_change(self):
         old = dict(a=1, b=2, c=3)
@@ -775,9 +731,164 @@ class DiffDict(test.TestCase):
         self.assertEqual(diff, dict(b=['-']))
 
 
-class EnsureTree(test.TestCase):
-    def test_ensure_tree(self):
-        with utils.tempdir() as tmpdir:
-            testdir = '%s/foo/bar/baz' % (tmpdir,)
-            utils.ensure_tree(testdir)
-            self.assertTrue(os.path.isdir(testdir))
+class MkfsTestCase(test.TestCase):
+
+    def test_mkfs(self):
+        self.mox.StubOutWithMock(utils, 'execute')
+        utils.execute('mkfs', '-t', 'ext4', '-F', '/my/block/dev')
+        utils.execute('mkfs', '-t', 'msdos', '/my/msdos/block/dev')
+        utils.execute('mkswap', '/my/swap/block/dev')
+        self.mox.ReplayAll()
+
+        utils.mkfs('ext4', '/my/block/dev')
+        utils.mkfs('msdos', '/my/msdos/block/dev')
+        utils.mkfs('swap', '/my/swap/block/dev')
+
+    def test_mkfs_with_label(self):
+        self.mox.StubOutWithMock(utils, 'execute')
+        utils.execute('mkfs', '-t', 'ext4', '-F',
+                      '-L', 'ext4-vol', '/my/block/dev')
+        utils.execute('mkfs', '-t', 'msdos',
+                      '-n', 'msdos-vol', '/my/msdos/block/dev')
+        utils.execute('mkswap', '-L', 'swap-vol', '/my/swap/block/dev')
+        self.mox.ReplayAll()
+
+        utils.mkfs('ext4', '/my/block/dev', 'ext4-vol')
+        utils.mkfs('msdos', '/my/msdos/block/dev', 'msdos-vol')
+        utils.mkfs('swap', '/my/swap/block/dev', 'swap-vol')
+
+
+class LastBytesTestCase(test.TestCase):
+    """Test the last_bytes() utility method."""
+
+    def setUp(self):
+        super(LastBytesTestCase, self).setUp()
+        self.f = StringIO.StringIO('1234567890')
+
+    def test_truncated(self):
+        self.f.seek(0, os.SEEK_SET)
+        out, remaining = utils.last_bytes(self.f, 5)
+        self.assertEqual(out, '67890')
+        self.assertTrue(remaining > 0)
+
+    def test_read_all(self):
+        self.f.seek(0, os.SEEK_SET)
+        out, remaining = utils.last_bytes(self.f, 1000)
+        self.assertEqual(out, '1234567890')
+        self.assertFalse(remaining > 0)
+
+    def test_seek_too_far_real_file(self):
+        # StringIO doesn't raise IOError if you see past the start of the file.
+        flo = tempfile.TemporaryFile()
+        content = '1234567890'
+        flo.write(content)
+        self.assertEqual((content, 0), utils.last_bytes(flo, 1000))
+
+
+class IntLikeTestCase(test.TestCase):
+
+    def test_is_int_like(self):
+        self.assertTrue(utils.is_int_like(1))
+        self.assertTrue(utils.is_int_like("1"))
+        self.assertTrue(utils.is_int_like("514"))
+        self.assertTrue(utils.is_int_like("0"))
+
+        self.assertFalse(utils.is_int_like(1.1))
+        self.assertFalse(utils.is_int_like("1.1"))
+        self.assertFalse(utils.is_int_like("1.1.1"))
+        self.assertFalse(utils.is_int_like(None))
+        self.assertFalse(utils.is_int_like("0."))
+        self.assertFalse(utils.is_int_like("aaaaaa"))
+        self.assertFalse(utils.is_int_like("...."))
+        self.assertFalse(utils.is_int_like("1g"))
+        self.assertFalse(
+            utils.is_int_like("0cc3346e-9fef-4445-abe6-5d2b2690ec64"))
+        self.assertFalse(utils.is_int_like("a1"))
+
+
+class MetadataToDictTestCase(test.TestCase):
+    def test_metadata_to_dict(self):
+        self.assertEqual(utils.metadata_to_dict(
+                [{'key': 'foo1', 'value': 'bar'},
+                 {'key': 'foo2', 'value': 'baz'}]),
+                         {'foo1': 'bar', 'foo2': 'baz'})
+
+    def test_metadata_to_dict_empty(self):
+        self.assertEqual(utils.metadata_to_dict([]), {})
+
+    def test_dict_to_metadata(self):
+        expected = [{'key': 'foo1', 'value': 'bar1'},
+                    {'key': 'foo2', 'value': 'bar2'}]
+        self.assertEqual(utils.dict_to_metadata(dict(foo1='bar1',
+                                                     foo2='bar2')),
+                         expected)
+
+    def test_dict_to_metadata_empty(self):
+        self.assertEqual(utils.dict_to_metadata({}), [])
+
+
+class WrappedCodeTestCase(test.TestCase):
+    """Test the get_wrapped_function utility method."""
+
+    def _wrapper(self, function):
+        @functools.wraps(function)
+        def decorated_function(self, *args, **kwargs):
+            function(self, *args, **kwargs)
+        return decorated_function
+
+    def test_single_wrapped(self):
+        @self._wrapper
+        def wrapped(self, instance, red=None, blue=None):
+            pass
+
+        func = utils.get_wrapped_function(wrapped)
+        func_code = func.func_code
+        self.assertEqual(4, len(func_code.co_varnames))
+        self.assertTrue('self' in func_code.co_varnames)
+        self.assertTrue('instance' in func_code.co_varnames)
+        self.assertTrue('red' in func_code.co_varnames)
+        self.assertTrue('blue' in func_code.co_varnames)
+
+    def test_double_wrapped(self):
+        @self._wrapper
+        @self._wrapper
+        def wrapped(self, instance, red=None, blue=None):
+            pass
+
+        func = utils.get_wrapped_function(wrapped)
+        func_code = func.func_code
+        self.assertEqual(4, len(func_code.co_varnames))
+        self.assertTrue('self' in func_code.co_varnames)
+        self.assertTrue('instance' in func_code.co_varnames)
+        self.assertTrue('red' in func_code.co_varnames)
+        self.assertTrue('blue' in func_code.co_varnames)
+
+    def test_triple_wrapped(self):
+        @self._wrapper
+        @self._wrapper
+        @self._wrapper
+        def wrapped(self, instance, red=None, blue=None):
+            pass
+
+        func = utils.get_wrapped_function(wrapped)
+        func_code = func.func_code
+        self.assertEqual(4, len(func_code.co_varnames))
+        self.assertTrue('self' in func_code.co_varnames)
+        self.assertTrue('instance' in func_code.co_varnames)
+        self.assertTrue('red' in func_code.co_varnames)
+        self.assertTrue('blue' in func_code.co_varnames)
+
+
+class StringLengthTestCase(test.TestCase):
+    def test_check_string_length(self):
+        self.assertIsNone(utils.check_string_length(
+                          'test', 'name', max_length=255))
+        self.assertRaises(exception.InvalidInput,
+                          utils.check_string_length,
+                          11, 'name', max_length=255)
+        self.assertRaises(exception.InvalidInput,
+                          utils.check_string_length,
+                          '', 'name', min_length=1)
+        self.assertRaises(exception.InvalidInput,
+                          utils.check_string_length,
+                          'a' * 256, 'name', max_length=255)

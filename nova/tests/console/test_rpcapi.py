@@ -18,42 +18,47 @@
 Unit Tests for nova.console.rpcapi
 """
 
+from oslo.config import cfg
+
 from nova.console import rpcapi as console_rpcapi
 from nova import context
-from nova import flags
 from nova.openstack.common import rpc
 from nova import test
 
-
-FLAGS = flags.FLAGS
+CONF = cfg.CONF
 
 
 class ConsoleRpcAPITestCase(test.TestCase):
-    def _test_console_api(self, method, **kwargs):
+    def _test_console_api(self, method, rpc_method, **kwargs):
         ctxt = context.RequestContext('fake_user', 'fake_project')
         rpcapi = console_rpcapi.ConsoleAPI()
+        expected_retval = 'foo' if method == 'call' else None
+        expected_version = kwargs.pop('version', rpcapi.BASE_RPC_API_VERSION)
         expected_msg = rpcapi.make_msg(method, **kwargs)
-        expected_msg['version'] = rpcapi.BASE_RPC_API_VERSION
+        expected_msg['version'] = expected_version
 
-        self.cast_ctxt = None
-        self.cast_topic = None
-        self.cast_msg = None
+        self.fake_args = None
+        self.fake_kwargs = None
 
-        def _fake_cast(_ctxt, _topic, _msg):
-            self.cast_ctxt = _ctxt
-            self.cast_topic = _topic
-            self.cast_msg = _msg
+        def _fake_rpc_method(*args, **kwargs):
+            self.fake_args = args
+            self.fake_kwargs = kwargs
+            if expected_retval:
+                return expected_retval
 
-        self.stubs.Set(rpc, 'cast', _fake_cast)
+        self.stubs.Set(rpc, rpc_method, _fake_rpc_method)
 
-        getattr(rpcapi, method)(ctxt, **kwargs)
+        retval = getattr(rpcapi, method)(ctxt, **kwargs)
 
-        self.assertEqual(self.cast_ctxt, ctxt)
-        self.assertEqual(self.cast_topic, FLAGS.console_topic)
-        self.assertEqual(self.cast_msg, expected_msg)
+        self.assertEqual(retval, expected_retval)
+        expected_args = [ctxt, CONF.console_topic, expected_msg]
+        for arg, expected_arg in zip(self.fake_args, expected_args):
+            self.assertEqual(arg, expected_arg)
 
     def test_add_console(self):
-        self._test_console_api('add_console', instance_id='i')
+        self._test_console_api('add_console', instance_id='i',
+                               rpc_method='cast')
 
     def test_remove_console(self):
-        self._test_console_api('remove_console', console_id='i')
+        self._test_console_api('remove_console', console_id='i',
+                               rpc_method='cast')

@@ -36,7 +36,7 @@ def get_host_from_body(fn):
         if len(body) == 1 and "host" in body:
             host = body['host']
         else:
-            raise exc.HTTPBadRequest
+            raise exc.HTTPBadRequest()
         return fn(self, req, id, host, *args, **kwargs)
     return wrapped
 
@@ -59,23 +59,24 @@ class AggregateController(object):
         authorize(context)
 
         if len(body) != 1:
-            raise exc.HTTPBadRequest
+            raise exc.HTTPBadRequest()
         try:
             host_aggregate = body["aggregate"]
             name = host_aggregate["name"]
             avail_zone = host_aggregate["availability_zone"]
         except KeyError:
-            raise exc.HTTPBadRequest
+            raise exc.HTTPBadRequest()
         if len(host_aggregate) != 2:
-            raise exc.HTTPBadRequest
+            raise exc.HTTPBadRequest()
 
         try:
             aggregate = self.api.create_aggregate(context, name, avail_zone)
-        except (exception.AggregateNameExists,
-                exception.InvalidAggregateAction):
-            LOG.info(_("Cannot create aggregate with name %(name)s and "
-                            "availability zone %(avail_zone)s") % locals())
-            raise exc.HTTPConflict
+        except exception.AggregateNameExists as e:
+            LOG.info(e)
+            raise exc.HTTPConflict()
+        except exception.InvalidAggregateAction as e:
+            LOG.info(e)
+            raise
         return self._marshall_aggregate(aggregate)
 
     def show(self, req, id):
@@ -85,8 +86,8 @@ class AggregateController(object):
         try:
             aggregate = self.api.get_aggregate(context, id)
         except exception.AggregateNotFound:
-            LOG.info(_("Cannot show aggregate: %(id)s") % locals())
-            raise exc.HTTPNotFound
+            LOG.info(_("Cannot show aggregate: %s"), id)
+            raise exc.HTTPNotFound()
         return self._marshall_aggregate(aggregate)
 
     def update(self, req, id, body):
@@ -95,24 +96,24 @@ class AggregateController(object):
         authorize(context)
 
         if len(body) != 1:
-            raise exc.HTTPBadRequest
+            raise exc.HTTPBadRequest()
         try:
             updates = body["aggregate"]
         except KeyError:
-            raise exc.HTTPBadRequest
+            raise exc.HTTPBadRequest()
 
         if len(updates) < 1:
-            raise exc.HTTPBadRequest
+            raise exc.HTTPBadRequest()
 
         for key in updates.keys():
-            if not key in ["name", "availability_zone"]:
-                raise exc.HTTPBadRequest
+            if key not in ["name", "availability_zone"]:
+                raise exc.HTTPBadRequest()
 
         try:
             aggregate = self.api.update_aggregate(context, id, updates)
         except exception.AggregateNotFound:
-            LOG.info(_("Cannot update aggregate: %(id)s") % locals())
-            raise exc.HTTPNotFound
+            LOG.info(_('Cannot update aggregate: %s'), id)
+            raise exc.HTTPNotFound()
 
         return self._marshall_aggregate(aggregate)
 
@@ -123,8 +124,8 @@ class AggregateController(object):
         try:
             self.api.delete_aggregate(context, id)
         except exception.AggregateNotFound:
-            LOG.info(_("Cannot delete aggregate: %(id)s") % locals())
-            raise exc.HTTPNotFound
+            LOG.info(_('Cannot delete aggregate: %s'), id)
+            raise exc.HTTPNotFound()
 
     def action(self, req, id, body):
         _actions = {
@@ -136,7 +137,7 @@ class AggregateController(object):
             try:
                 return _actions[action](req, id, data)
             except KeyError:
-                msg = _("Aggregates does not have %s action") % action
+                msg = _('Aggregates does not have %s action') % action
                 raise exc.HTTPBadRequest(explanation=msg)
 
         raise exc.HTTPBadRequest(explanation=_("Invalid request body"))
@@ -149,14 +150,14 @@ class AggregateController(object):
         try:
             aggregate = self.api.add_host_to_aggregate(context, id, host)
         except (exception.AggregateNotFound, exception.ComputeHostNotFound):
-            LOG.info(_("Cannot add host %(host)s in aggregate "
-                            "%(id)s") % locals())
-            raise exc.HTTPNotFound
+            LOG.info(_('Cannot add host %(host)s in aggregate %(id)s'),
+                     {'host': host, 'id': id})
+            raise exc.HTTPNotFound()
         except (exception.AggregateHostExists,
                 exception.InvalidAggregateAction):
-            LOG.info(_("Cannot add host %(host)s in aggregate "
-                            "%(id)s") % locals())
-            raise exc.HTTPConflict
+            LOG.info(_('Cannot add host %(host)s in aggregate %(id)s'),
+                     {'host': host, 'id': id})
+            raise exc.HTTPConflict()
         return self._marshall_aggregate(aggregate)
 
     @get_host_from_body
@@ -166,14 +167,15 @@ class AggregateController(object):
         authorize(context)
         try:
             aggregate = self.api.remove_host_from_aggregate(context, id, host)
-        except (exception.AggregateNotFound, exception.AggregateHostNotFound):
-            LOG.info(_("Cannot remove host %(host)s in aggregate "
-                            "%(id)s") % locals())
-            raise exc.HTTPNotFound
+        except (exception.AggregateNotFound, exception.AggregateHostNotFound,
+                exception.ComputeHostNotFound):
+            LOG.info(_('Cannot remove host %(host)s in aggregate %(id)s'),
+                     {'host': host, 'id': id})
+            raise exc.HTTPNotFound()
         except exception.InvalidAggregateAction:
-            LOG.info(_("Cannot remove host %(host)s in aggregate "
-                "%(id)s") % locals())
-            raise exc.HTTPConflict
+            LOG.info(_('Cannot remove host %(host)s in aggregate %(id)s'),
+                     {'host': host, 'id': id})
+            raise exc.HTTPConflict()
         return self._marshall_aggregate(aggregate)
 
     def _set_metadata(self, req, id, body):
@@ -182,18 +184,18 @@ class AggregateController(object):
         authorize(context)
 
         if len(body) != 1:
-            raise exc.HTTPBadRequest
+            raise exc.HTTPBadRequest()
         try:
             metadata = body["metadata"]
         except KeyError:
-            raise exc.HTTPBadRequest
+            raise exc.HTTPBadRequest()
         try:
             aggregate = self.api.update_aggregate_metadata(context,
                                                            id, metadata)
         except exception.AggregateNotFound:
-            LOG.info(_("Cannot set metadata %(metadata)s in aggregate "
-                            "%(id)s") % locals())
-            raise exc.HTTPNotFound
+            LOG.info(_('Cannot set metadata %(metadata)s in aggregate %(id)s'),
+                     {'metadata': metadata, 'id': id})
+            raise exc.HTTPNotFound()
 
         return self._marshall_aggregate(aggregate)
 
@@ -202,7 +204,7 @@ class AggregateController(object):
 
 
 class Aggregates(extensions.ExtensionDescriptor):
-    """Admin-only aggregate administration"""
+    """Admin-only aggregate administration."""
 
     name = "Aggregates"
     alias = "os-aggregates"

@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2010 OpenStack, LLC.
+# Copyright (c) 2010 OpenStack Foundation
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
 #
@@ -18,40 +18,41 @@
 
 """Tests For Console proxy."""
 
+from oslo.config import cfg
+
 from nova.console import api as console_api
 from nova.console import rpcapi as console_rpcapi
 from nova import context
 from nova import db
 from nova import exception
-from nova import flags
 from nova.openstack.common import importutils
 from nova.openstack.common import rpc
 from nova import test
 
-FLAGS = flags.FLAGS
-flags.DECLARE('console_driver', 'nova.console.manager')
+CONF = cfg.CONF
+CONF.import_opt('console_manager', 'nova.service')
+CONF.import_opt('console_driver', 'nova.console.manager')
 
 
 class ConsoleTestCase(test.TestCase):
-    """Test case for console proxy manager"""
+    """Test case for console proxy manager."""
     def setUp(self):
         super(ConsoleTestCase, self).setUp()
         self.flags(console_driver='nova.console.fake.FakeConsoleProxy',
                    stub_compute=True)
-        self.console = importutils.import_object(FLAGS.console_manager)
+        self.console = importutils.import_object(CONF.console_manager)
         self.user_id = 'fake'
         self.project_id = 'fake'
         self.context = context.RequestContext(self.user_id, self.project_id)
         self.host = 'test_compute_host'
 
     def _create_instance(self):
-        """Create a test instance"""
+        """Create a test instance."""
         inst = {}
         #inst['host'] = self.host
         #inst['name'] = 'instance-1234'
         inst['image_id'] = 1
         inst['reservation_id'] = 'r-fakeres'
-        inst['launch_time'] = '10'
         inst['user_id'] = self.user_id
         inst['project_id'] = self.project_id
         inst['instance_type_id'] = 1
@@ -98,7 +99,7 @@ class ConsoleTestCase(test.TestCase):
                 instance['host'], self.console.host,
                 self.console.driver.console_type)
 
-        console_instances = [con['instance_uuid'] for con in pool.consoles]
+        console_instances = [con['instance_uuid'] for con in pool['consoles']]
         self.assert_(instance['uuid'] in console_instances)
         db.instance_destroy(self.context, instance['uuid'])
 
@@ -122,7 +123,7 @@ class ConsoleTestCase(test.TestCase):
 
 
 class ConsoleAPITestCase(test.TestCase):
-    """Test case for console API"""
+    """Test case for console API."""
     def setUp(self):
         super(ConsoleAPITestCase, self).setUp()
 

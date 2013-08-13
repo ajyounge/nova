@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright (c) 2011 OpenStack, LLC
+# Copyright (c) 2011 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -18,32 +18,40 @@ Common Auth Middleware.
 
 """
 
+from oslo.config import cfg
 import webob.dec
 import webob.exc
 
 from nova import context
-from nova import flags
-from nova.openstack.common import cfg
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
 from nova import wsgi
 
 
-use_forwarded_for_opt = cfg.BoolOpt('use_forwarded_for',
-        default=False,
-        help='Treat X-Forwarded-For as the canonical remote address. '
-             'Only enable this if you have a sanitizing proxy.')
+auth_opts = [
+    cfg.BoolOpt('api_rate_limit',
+                default=True,
+                help='whether to rate limit the api'),
+    cfg.StrOpt('auth_strategy',
+               default='noauth',
+               help='The strategy to use for auth: noauth or keystone.'),
+    cfg.BoolOpt('use_forwarded_for',
+                default=False,
+                help='Treat X-Forwarded-For as the canonical remote address. '
+                     'Only enable this if you have a sanitizing proxy.'),
+]
 
-FLAGS = flags.FLAGS
-FLAGS.register_opt(use_forwarded_for_opt)
+CONF = cfg.CONF
+CONF.register_opts(auth_opts)
+
 LOG = logging.getLogger(__name__)
 
 
 def pipeline_factory(loader, global_conf, **local_conf):
     """A paste pipeline replica that keys off of auth_strategy."""
-    pipeline = local_conf[FLAGS.auth_strategy]
-    if not FLAGS.api_rate_limit:
-        limit_name = FLAGS.auth_strategy + '_nolimit'
+    pipeline = local_conf[CONF.auth_strategy]
+    if not CONF.api_rate_limit:
+        limit_name = CONF.auth_strategy + '_nolimit'
         pipeline = local_conf.get(limit_name, pipeline)
     pipeline = pipeline.split()
     filters = [loader.get_filter(n) for n in pipeline[:-1]]
@@ -68,7 +76,7 @@ class InjectContext(wsgi.Middleware):
 
 
 class NovaKeystoneContext(wsgi.Middleware):
-    """Make a request context from keystone headers"""
+    """Make a request context from keystone headers."""
 
     @webob.dec.wsgify(RequestClass=wsgi.Request)
     def __call__(self, req):
@@ -95,7 +103,7 @@ class NovaKeystoneContext(wsgi.Middleware):
 
         # Build a context, including the auth_token...
         remote_address = req.remote_addr
-        if FLAGS.use_forwarded_for:
+        if CONF.use_forwarded_for:
             remote_address = req.headers.get('X-Forwarded-For', remote_address)
 
         service_catalog = None
@@ -120,7 +128,7 @@ class NovaKeystoneContext(wsgi.Middleware):
         return self.application
 
     def _get_roles(self, req):
-        """Get the list of roles"""
+        """Get the list of roles."""
 
         if 'X_ROLES' in req.headers:
             roles = req.headers.get('X_ROLES', '')

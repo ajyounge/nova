@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2011 OpenStack LLC.
+# Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -18,7 +18,12 @@
 import os.path
 
 from lxml import etree
+from xml.dom import minidom
+from xml.parsers import expat
+from xml import sax
+from xml.sax import expatreader
 
+from nova import exception
 from nova import utils
 
 
@@ -28,12 +33,12 @@ XMLNS_COMMON_V10 = 'http://docs.openstack.org/common/api/v1.0'
 XMLNS_ATOM = 'http://www.w3.org/2005/Atom'
 
 
-def validate_schema(xml, schema_name):
+def validate_schema(xml, schema_name, version='v1.1'):
     if isinstance(xml, str):
         xml = etree.fromstring(xml)
-    base_path = 'nova/api/openstack/compute/schemas/v1.1/'
-    if schema_name in ('atom', 'atom-link'):
-        base_path = 'nova/api/openstack/compute/schemas/'
+    base_path = 'nova/api/openstack/compute/schemas/'
+    if schema_name not in ('atom', 'atom-link'):
+        base_path += '%s/' % version
     schema_path = os.path.join(utils.novadir(),
                                '%s%s.rng' % (base_path, schema_name))
     schema_doc = etree.parse(schema_path)
@@ -734,10 +739,9 @@ class MasterTemplate(Template):
 
             # Make sure we have a tree match
             if slave.root.tag != self.root.tag:
-                slavetag = slave.root.tag
-                mastertag = self.root.tag
-                msg = _("Template tree mismatch; adding slave %(slavetag)s "
-                        "to master %(mastertag)s") % locals()
+                msg = _("Template tree mismatch; adding slave %(slavetag)s to "
+                        "master %(mastertag)s") % {'slavetag': slave.root.tag,
+                                                   'mastertag': self.root.tag}
                 raise ValueError(msg)
 
             # Make sure slave applies to this template
@@ -905,3 +909,59 @@ def make_flat_dict(name, selector=None, subselector=None, ns=None):
 
     # Return the template
     return root
+
+
+class ProtectedExpatParser(expatreader.ExpatParser):
+    """An expat parser which disables DTD's and entities by default."""
+
+    def __init__(self, forbid_dtd=True, forbid_entities=True,
+                 *args, **kwargs):
+        # Python 2.x old style class
+        expatreader.ExpatParser.__init__(self, *args, **kwargs)
+        self.forbid_dtd = forbid_dtd
+        self.forbid_entities = forbid_entities
+
+    def start_doctype_decl(self, name, sysid, pubid, has_internal_subset):
+        raise ValueError("Inline DTD forbidden")
+
+    def entity_decl(self, entityName, is_parameter_entity, value, base,
+                    systemId, publicId, notationName):
+        raise ValueError("<!ENTITY> entity declaration forbidden")
+
+    def unparsed_entity_decl(self, name, base, sysid, pubid, notation_name):
+        # expat 1.2
+        raise ValueError("<!ENTITY> unparsed entity forbidden")
+
+    def external_entity_ref(self, context, base, systemId, publicId):
+        raise ValueError("<!ENTITY> external entity forbidden")
+
+    def notation_decl(self, name, base, sysid, pubid):
+        raise ValueError("<!ENTITY> notation forbidden")
+
+    def reset(self):
+        expatreader.ExpatParser.reset(self)
+        if self.forbid_dtd:
+            self._parser.StartDoctypeDeclHandler = self.start_doctype_decl
+            self._parser.EndDoctypeDeclHandler = None
+        if self.forbid_entities:
+            self._parser.EntityDeclHandler = self.entity_decl
+            self._parser.UnparsedEntityDeclHandler = self.unparsed_entity_decl
+            self._parser.ExternalEntityRefHandler = self.external_entity_ref
+            self._parser.NotationDeclHandler = self.notation_decl
+            try:
+                self._parser.SkippedEntityHandler = None
+            except AttributeError:
+                # some pyexpat versions do not support SkippedEntity
+                pass
+
+
+def safe_minidom_parse_string(xml_string):
+    """Parse an XML string using minidom safely."""
+    try:
+        return minidom.parseString(xml_string, parser=ProtectedExpatParser())
+    except (sax.SAXParseException, ValueError,
+            expat.ExpatError, LookupError) as e:
+        #NOTE(Vijaya Erukala): XML input such as
+        #                      <?xml version="1.0" encoding="TF-8"?>
+        #                      raises LookupError: unknown encoding: TF-8
+        raise exception.MalformedRequestBody(reason=str(e))

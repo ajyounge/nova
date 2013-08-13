@@ -1,4 +1,4 @@
-# Copyright 2011 OpenStack LLC.
+# Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -33,17 +33,11 @@ from nova.api.openstack import xmlutil
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova import quota
+from nova import utils
 from nova import wsgi as base_wsgi
 
 
 QUOTAS = quota.QUOTAS
-
-
-# Convenience constants for the limits dictionary passed to Limiter().
-PER_SECOND = 1
-PER_MINUTE = 60
-PER_HOUR = 60 * 60
-PER_DAY = 60 * 60 * 24
 
 
 limits_nsmap = {None: xmlutil.XMLNS_COMMON_V10, 'atom': xmlutil.XMLNS_ATOM}
@@ -75,15 +69,11 @@ class LimitsTemplate(xmlutil.TemplateBuilder):
 
 
 class LimitsController(object):
-    """
-    Controller for accessing limits in the OpenStack API.
-    """
+    """Controller for accessing limits in the OpenStack API."""
 
     @wsgi.serializers(xml=LimitsTemplate)
     def index(self, req):
-        """
-        Return all global and rate limit information.
-        """
+        """Return all global and rate limit information."""
         context = req.environ['nova.context']
         quotas = QUOTAS.get_project_quotas(context, context.project_id,
                                            usages=False)
@@ -92,6 +82,26 @@ class LimitsController(object):
 
         builder = self._get_view_builder(req)
         return builder.build(rate_limits, abs_limits)
+
+    def create(self, req, body):
+        """Create a new limit."""
+        raise webob.exc.HTTPNotImplemented()
+
+    def delete(self, req, id):
+        """Delete the limit."""
+        raise webob.exc.HTTPNotImplemented()
+
+    def detail(self, req):
+        """Return limit details."""
+        raise webob.exc.HTTPNotImplemented()
+
+    def show(self, req, id):
+        """Show limit information."""
+        raise webob.exc.HTTPNotImplemented()
+
+    def update(self, req, id, body):
+        """Update existing limit."""
+        raise webob.exc.HTTPNotImplemented()
 
     def _get_view_builder(self, req):
         return limits_views.ViewBuilder()
@@ -106,14 +116,7 @@ class Limit(object):
     Stores information about a limit for HTTP requests.
     """
 
-    UNITS = {
-        1: "SECOND",
-        60: "MINUTE",
-        60 * 60: "HOUR",
-        60 * 60 * 24: "DAY",
-    }
-
-    UNIT_MAP = dict([(v, k) for k, v in UNITS.items()])
+    UNITS = dict([(v, k) for k, v in utils.TIME_UNITS.items()])
 
     def __init__(self, verb, uri, regex, value, unit):
         """
@@ -207,11 +210,13 @@ class Limit(object):
 # a regular-expression to match, value and unit of measure (PER_DAY, etc.)
 
 DEFAULT_LIMITS = [
-    Limit("POST", "*", ".*", 10, PER_MINUTE),
-    Limit("POST", "*/servers", "^/servers", 50, PER_DAY),
-    Limit("PUT", "*", ".*", 10, PER_MINUTE),
-    Limit("GET", "*changes-since*", ".*changes-since.*", 3, PER_MINUTE),
-    Limit("DELETE", "*", ".*", 100, PER_MINUTE),
+    Limit("POST", "*", ".*", 10, utils.TIME_UNITS['MINUTE']),
+    Limit("POST", "*/servers", "^/servers", 50, utils.TIME_UNITS['DAY']),
+    Limit("PUT", "*", ".*", 10, utils.TIME_UNITS['MINUTE']),
+    Limit("GET", "*changes-since*", ".*changes-since.*", 3,
+          utils.TIME_UNITS['MINUTE']),
+    Limit("DELETE", "*", ".*", 100, utils.TIME_UNITS['MINUTE']),
+    Limit("GET", "*/os-fping", "^/os-fping", 12, utils.TIME_UNITS['HOUR']),
 ]
 
 
@@ -373,9 +378,9 @@ class Limiter(object):
 
             # Convert unit
             unit = unit.upper()
-            if unit not in Limit.UNIT_MAP:
+            if unit not in utils.TIME_UNITS:
                 raise ValueError("Invalid units specified")
-            unit = Limit.UNIT_MAP[unit]
+            unit = utils.TIME_UNITS[unit]
 
             # Build a limit
             result.append(Limit(verb, uri, regex, value, unit))

@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2010 OpenStack LLC.
+# Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -44,4 +44,3 @@ SOFT_DELETED = 'soft-delete'  # VM is marked as deleted but the disk images are
 DELETED = 'deleted'  # VM is permanently deleted.
 
 ERROR = 'error'
-OVERCOMMIT = 'overcommit'
